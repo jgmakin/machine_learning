@@ -1,7 +1,7 @@
 # machine_learning
 a collection of packages for ML projects, written in Tensorflow's Python API
 
-See [`ecog2txt`](https://github.com/jgmakin/ecog2txt)
+See [`ecog2txt`](https://github.com/jgmakin/ecog2txt).
 
 ## Installation
 ```
