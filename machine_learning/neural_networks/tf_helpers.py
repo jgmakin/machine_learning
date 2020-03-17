@@ -10,7 +10,7 @@ from tensorflow.python.client import device_lib
 from tensor2tensor.layers import common_layers
 
 # local
-from ...utils_jgm.toolbox import auto_attribute
+from utils_jgm.toolbox import auto_attribute
 
 '''
 A collection of helper functions for use with tensorflow

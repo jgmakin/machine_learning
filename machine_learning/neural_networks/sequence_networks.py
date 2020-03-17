@@ -19,8 +19,8 @@ from tensor2tensor.utils import beam_search as beam_search
 import tfmpl
 
 # local
-from ...utils_jgm import toolbox
-from ...utils_jgm.machine_compatibility_utils import MachineCompatibilityUtils
+from utils_jgm import toolbox
+from utils_jgm.machine_compatibility_utils import MachineCompatibilityUtils
 from . import basic_components as nn
 from . import tf_helpers as tfh
 
@@ -83,13 +83,11 @@ def dual_violin_plot(
     return fig
 
 
-def single_word_predictions(
-    word, unique_targets_list, targets_given_predictions
-):
+def single_word_predictions(word, targets_list, targets_given_predictions):
 
     prediction_counts_vector = targets_given_predictions[
-        unique_targets_list.index(word)]
-    predicted_words = list(np.array(unique_targets_list)[
+        targets_list.index(word)]
+    predicted_words = list(np.array(targets_list)[
         prediction_counts_vector > 0])
     prediction_counts = list(prediction_counts_vector[
         prediction_counts_vector > 0])
@@ -234,18 +232,26 @@ class SequenceNetwork:
         )
 
     def fit(
-        self, unique_targets_list, subnets_params, train_vars_scope=None,
-        reuse_vars_scope=None, **graph_kwargs
+        self, subnets_params, train_vars_scope=None, reuse_vars_scope=None,
+        **graph_kwargs
     ):
         '''
         Fit the parameters of a neural network mapping variable-length
         sequences to labels or to (variable-length) output sequences.
         '''
 
-        # dump a copy of the unique_targets_list with the checkpoint
-        with open(os.path.join(os.path.dirname(
-                self.checkpoint_path), 'unique_targets.pkl'), 'wb') as fp:
-            pickle.dump([t.encode('utf-8') for t in unique_targets_list], fp)
+        # dump to disk a copy of each categorical var's feature_list
+        for data_manifest in subnets_params[-1].data_manifests.values():
+            if data_manifest.distribution == 'categorical':
+                file_name = '_'.join([data_manifest.sequence_type, 'vocab_file.pkl'])
+                with open(os.path.join(
+                    os.path.dirname(self.checkpoint_path), file_name
+                ), 'wb') as fp:
+                    feature_list = [
+                        t.encode('utf-8')
+                        for t in data_manifest.get_feature_list()
+                    ]
+                    pickle.dump(feature_list, fp)
 
         # init
         with tf.device('/cpu:0'):
@@ -268,39 +274,42 @@ class SequenceNetwork:
 
         # only the *last* subnet is used for evaluation
         assessment_subnet_params = subnets_params[-1]
+        decoder_targets_list = assessment_subnet_params.data_manifests[
+            'decoder_targets'].get_feature_list()
 
         def training_data_fxn(num_GPUs):
-            return self._batch_and_split_data(
-                unique_targets_list, subnets_params, num_GPUs)
+            return self._batch_and_split_data(subnets_params, num_GPUs)
 
         def assessment_data_fxn(num_epochs):
             return self._generate_oneshot_datasets(
-                unique_targets_list, assessment_subnet_params, num_epochs)
+                assessment_subnet_params, num_epochs
+            )
 
         def training_net_builder(GPU_op_dict, CPU_op_dict, tower_name):
             return self._build_training_net(
                 GPU_op_dict, CPU_op_dict, subnets_params,
-                (unique_targets_list.index(self.EOS_token)
-                 if self.EOS_token in unique_targets_list else None),
+                (decoder_targets_list.index(self.EOS_token)
+                 if self.EOS_token in decoder_targets_list else None),
                 train_vars_scope, tower_name)
 
         @tfmpl.figure_tensor
         def plotting_fxn(confusions):
             fig = toolbox.draw_confusion_matrix(
-                confusions, unique_targets_list, (12, 12))
+                confusions,
+                (12, 12))
             return fig
 
         def assessment_net_builder(GPU_op_dict, CPU_op_dict):
             return self._build_assessment_net(
                 GPU_op_dict, CPU_op_dict, assessment_subnet_params,
-                unique_targets_list, self._standard_indexer, plotting_fxn)
+                decoder_targets_list, self._standard_indexer, plotting_fxn)
 
         def assessor(
             sess, assessment_struct, epoch, assessment_step, data_partition
         ):
             return self._assess(
                 sess, assessment_struct, epoch, assessment_step,
-                unique_targets_list, data_partition)
+                decoder_targets_list, data_partition)
 
         # use the general graph build to assemble these pieces
         graph_builder = tfh.GraphBuilder(
@@ -314,8 +323,8 @@ class SequenceNetwork:
         return graph_builder.train_and_assess(self.assessment_epoch_interval)
 
     def restore_and_get_saliencies(
-        self, unique_targets_list, subnets_params, restore_epoch,
-        assessment_type='norms', data_partition='validation', **graph_kwargs
+        self, subnets_params, restore_epoch, assessment_type='norms',
+        data_partition='validation', **graph_kwargs
     ):
 
         # init
@@ -324,6 +333,8 @@ class SequenceNetwork:
         self.FF_dropout = 0.0
         RNN_dropout = self.RNN_dropout
         self.RNN_dropout = 0.0
+        decoder_targets_list = subnets_params[-1].data_manifests[
+            'decoder_targets'].get_feature_list()
 
         class FakeOptimizer:
             def __init__(self):
@@ -337,7 +348,8 @@ class SequenceNetwork:
 
         def training_data_fxn(num_GPUs):
             return self._batch_and_split_data(
-                unique_targets_list, subnets_params, num_GPUs, data_partition)
+                subnets_params, num_GPUs, data_partition
+            )
 
         def training_net_builder(GPU_op_dict, CPU_op_dict, tower_name):
 
@@ -346,8 +358,8 @@ class SequenceNetwork:
 
             total_loss, train_vars = self._build_training_net(
                 GPU_op_dict, CPU_op_dict, subnets_params,
-                (unique_targets_list.index(self.EOS_token)
-                 if self.EOS_token in unique_targets_list else None),
+                (decoder_targets_list.index(self.EOS_token)
+                 if self.EOS_token in decoder_targets_list else None),
                 None, tower_name)
             return total_loss, GPU_op_dict['encoder_inputs']
 
@@ -505,13 +517,12 @@ class SequenceNetwork:
 
         ##########
     def save_prediction_graph(
-        self, subnets_params, unique_targets_list, restore_epoch, save_dir,
-        num_sequences=1, max_hyp_length=20, inputs_dtype=tf.float32
+        self, subnets_params, restore_epoch, save_dir, num_sequences=1,
+        max_hyp_length=20, inputs_dtype=tf.float32
     ):
         '''
         Save the graph so that it can later be loaded and used for inference.
 
-        :param unique_targets_list:
         :param subnets_params:
         :param restore_epoch:
         :param N
@@ -529,6 +540,8 @@ class SequenceNetwork:
             None,
             subnets_params[0].data_manifests['encoder_inputs'].num_features
         ]
+        decoder_targets_list = subnets_params[0].data_manifests[
+            'decoder_targets'].get_feature_list()
 
         # the inference graph
         prediction_graph = tf.Graph()
@@ -562,11 +575,11 @@ class SequenceNetwork:
                     {
                         'subnet_id': tf.constant(subnets_params[0].subnet_id)
                     },
-                    subnets_params[0], unique_targets_list, indexing_fxn, None
+                    subnets_params[0], decoder_targets_list, indexing_fxn, None
                 )
             get_decoder_probs = tf.nn.softmax(get_decoder_natural_params)
 
-            # if no unique_targets_list was passed...
+            # if no decoder_targets_list was passed...
             get_sequenced_decoder_outputs = tf.identity(
                 get_sequenced_decoder_outputs, name='sequenced_decoder_outputs')
             get_decoder_probs = tf.identity(
@@ -589,7 +602,7 @@ class SequenceNetwork:
             )
 
     def _build_assessment_net(
-        self, sequenced_op_dict, CPU_op_dict, params, unique_targets_list,
+        self, sequenced_op_dict, CPU_op_dict, params, decoder_targets_list,
         indexing_fxn, plotting_fxn
     ):
 
@@ -620,14 +633,14 @@ class SequenceNetwork:
         (sequenced_op_dict, desequenced_op_dict, decoder_sequence_log_probs
          ) = assess_decoding(
             sequenced_op_dict, desequenced_op_dict, params,
-            unique_targets_list, initial_initial_ind, num_loops, indexing_fxn
+            decoder_targets_list, initial_initial_ind, num_loops, indexing_fxn
         )
 
         # don't bother to write unless there is something to plot (??)
         if plotting_fxn is not None:
             self._write_assessments(
                 sequenced_op_dict, desequenced_op_dict,
-                decoder_sequence_log_probs, params, unique_targets_list,
+                decoder_sequence_log_probs, params, decoder_targets_list,
                 plotting_fxn
             )
 
@@ -636,7 +649,7 @@ class SequenceNetwork:
 
     def _assess_token_decoding(
         self, sequenced_op_dict, desequenced_op_dict, params,
-        unique_targets_list, initial_initial_ind, num_loops, indexer
+        decoder_targets_list, initial_initial_ind, num_loops, indexer
     ):
 
         # "desequence," which for token outputs amounts to removing final dim
@@ -724,14 +737,14 @@ class SequenceNetwork:
         (sequenced_op_dict['decoder_targets'],
          sequenced_op_dict['decoder_outputs'],
          decoder_sequence_log_probs) = nn.fake_beam_for_sequence_targets(
-            desequenced_op_dict, unique_targets_list, self.beam_width,
+            desequenced_op_dict, decoder_targets_list, self.beam_width,
             self.pad_token)
 
         return sequenced_op_dict, desequenced_op_dict, decoder_sequence_log_probs
 
     def _assess_sequence_decoding(
         self, sequenced_op_dict, desequenced_op_dict, params,
-        unique_targets_list, initial_initial_ind, num_loops, indexer
+        decoder_targets_list, initial_initial_ind, num_loops, indexer
     ):
         # index the target sequences
         index_sequences_elements, max_targ_length = indexer(
@@ -775,7 +788,7 @@ class SequenceNetwork:
                 (get_sequenced_decoder_outputs, get_decoder_sequence_log_probs
                  ) = self._decode_assessment_sequences(
                     get_final_state, sequenced_op_dict['decoder_targets'], params,
-                    unique_targets_list, max_targ_length)
+                    decoder_targets_list, max_targ_length)
 
                 # As though the beam were (beam_width*temporal stride) wide
                 targ_length = tf.shape(get_sequenced_decoder_outputs)[2]
@@ -1172,10 +1185,10 @@ class SequenceNetwork:
 
     def _decode_assessment_sequences(
         self, final_encoder_state, get_targets, subnet_params,
-        unique_targets_list, max_hyp_length,
+        decoder_targets_list, max_hyp_length,
     ):
 
-        eos_id = unique_targets_list.index(self.EOS_token)
+        eos_id = decoder_targets_list.index(self.EOS_token)
         Nsequences = common_layers.shape_list(final_encoder_state[-1].h)[0]
         num_decoder_target_features = subnet_params.data_manifests[
             'decoder_targets'].num_features
@@ -1378,7 +1391,7 @@ class SequenceNetwork:
 
     def _write_assessments(
         self, sequenced_op_dict, desequenced_op_dict,
-        decoder_sequence_log_probs, params, unique_targets_list, plotting_fxn
+        decoder_sequence_log_probs, params, decoder_targets_list, plotting_fxn
     ):
         # one can request any of the entries in either data dict
         for dictionary, dict_name in [
@@ -1428,8 +1441,8 @@ class SequenceNetwork:
                 'summarize_accuracy', assess_average_accuracy)
 
         # minimum edit distance between sequences of words
-        eos_id = (unique_targets_list.index(self.EOS_token)
-                  if self.EOS_token in unique_targets_list else -1)
+        eos_id = (decoder_targets_list.index(self.EOS_token)
+                  if self.EOS_token in decoder_targets_list else -1)
         get_word_error_rates = nn.tf_expected_word_error_rates(
             sequenced_op_dict, decoder_sequence_log_probs,
             EXCLUDE_EOS=True, eos_id=eos_id
@@ -1616,13 +1629,13 @@ class SequenceNetwork:
 
     def _assess(
         self, sess, assessment_struct, epoch, assessment_step,
-        unique_targets_list, data_partition
+        decoder_targets_list, data_partition
     ):
 
         # The summaries you wish to make for tensorboard.  You need a deep copy
         #  because you intend to alter the set on a temporary basis.
         summary_op_set = copy.copy(self.summary_op_set)
-        if len(unique_targets_list) > 100:
+        if len(decoder_targets_list) > 100:
             summary_op_set.discard('confusions_image')
         if (epoch % 10 != 0):
             summary_op_set.discard('confusions_image')
@@ -1671,8 +1684,8 @@ class SequenceNetwork:
                 # Non-sequence references/hypotheses are based on a fake_beam,
                 #  so we have to follow its lead and (re)build a unique tokens
                 #  list
-                unique_targets_list = nn.targets_to_tokens(
-                    unique_targets_list, self.pad_token)
+                decoder_targets_list = nn.targets_to_tokens(
+                    decoder_targets_list, self.pad_token)
 
             if (
                 'decoder_sequence_log_probs' in self.assessment_op_set and
@@ -1683,13 +1696,17 @@ class SequenceNetwork:
 
                 # references
                 sequenced_decoder_target = self.target_inds_to_sequences(
-                    assessment_struct.sequenced_decoder_targets, unique_targets_list)[0]
+                    assessment_struct.sequenced_decoder_targets,
+                    decoder_targets_list
+                )[0]
                 cprint('example ' + data_partition + ' reference:', on_color=on_clr)
                 cprint('\t' + sequenced_decoder_target, on_color='on_red')
 
                 # hypotheses
                 sequenced_decoder_outputs = self.target_inds_to_sequences(
-                    assessment_struct.sequenced_decoder_outputs, unique_targets_list)
+                    assessment_struct.sequenced_decoder_outputs,
+                    decoder_targets_list
+                )
                 decoder_sequence_log_probs = assessment_struct.decoder_sequence_log_probs[0]
                 log_probs = decoder_sequence_log_probs - logsumexp(
                     decoder_sequence_log_probs)
@@ -1705,10 +1722,10 @@ class SequenceNetwork:
                 for iExample in range(num_examples):
                     ref = self.target_inds_to_sequences(
                         assessment_struct.sequenced_decoder_targets,
-                        unique_targets_list, iExample)[0]
+                        decoder_targets_list, iExample)[0]
                     hyp = self.target_inds_to_sequences(
                         assessment_struct.sequenced_decoder_outputs,
-                        unique_targets_list, iExample)[0]
+                        decoder_targets_list, iExample)[0]
                     cprint('{0:60} {1}'.format(ref, hyp), on_color='on_cyan')
                     if iExample > 50:
                         break
@@ -1721,16 +1738,16 @@ class SequenceNetwork:
         return assessment_struct
 
     def _batch_and_split_data(
-        self, unique_targets_list, subnets_params, num_GPUs,
-        data_partition='training'
+        self, subnets_params, num_GPUs, data_partition='training'
     ):
         # remove any device specifications for the input data
         with tf.device(None):
 
             # create an iterator across batches from the tf_records
             dataset = self._tf_records_to_dataset(
-                unique_targets_list, subnets_params, data_partition,
-                self.Ncases, self.num_training_shards_to_discard)
+                subnets_params, data_partition, self.Ncases,
+                self.num_training_shards_to_discard
+            )
             iterator = tf.compat.v1.data.make_initializable_iterator(dataset)
 
             # get the next batch and break into sequences and subnet_id dicts
@@ -1750,9 +1767,7 @@ class SequenceNetwork:
 
             return GPU_split_op_dict, CPU_op_dict, iterator.initializer
 
-    def _generate_oneshot_datasets(
-        self, unique_targets_list, assessment_params, num_epochs
-    ):
+    def _generate_oneshot_datasets(self, assessment_params, num_epochs):
         # use as many training as *validation* samples
         num_assessment_examples = sum(
             [sum(1 for _ in tf.compat.v1.python_io.tf_record_iterator(
@@ -1763,8 +1778,8 @@ class SequenceNetwork:
         assessments = dict.fromkeys(self.assessment_partitions)
         for i, data_partition in enumerate(assessments):
             dataset = self._tf_records_to_dataset(
-                unique_targets_list, [assessment_params], data_partition,
-                num_assessment_examples)
+                [assessment_params], data_partition, num_assessment_examples
+            )
             if i == 0:
                 # create just one iterator---from *any* dataset's types
                 #  and shapes, since they're all the same
@@ -1800,8 +1815,7 @@ class SequenceNetwork:
         return predicted_tokens
 
     def _tf_records_to_dataset(
-        self, unique_targets_list, subnets_params, data_partition, num_cases,
-        num_shards_to_discard=0
+        self, subnets_params, data_partition, num_cases, num_shards_to_discard=0
     ):
         '''
         Load, shuffle, batch and pad, and concatentate across subnets (for
@@ -1822,21 +1836,25 @@ class SequenceNetwork:
                 ), num_parallel_calls=32
             )
 
-            # filter data to include or exclude only specified targets?
+            # filter data to include or exclude only specified decoder targets?
+            decoder_targets_list = subnet_params.data_manifests[
+                'decoder_targets'].get_feature_list()
             target_filter = TargetFilter(
-                unique_targets_list, subnet_params.target_specs, data_partition)
+                decoder_targets_list, subnet_params.target_specs,
+                data_partition
+            )
             dataset = target_filter.filter_dataset(dataset)
 
-            # filter out words not in the unique_targets_list
-            ######
-            # FIX ME
-            if False:  # not self.TARGETS_ARE_SEQUENCES:
-                OOV_id = (unique_targets_list.index(self.OOV_token)
-                          if self.OOV_token in unique_targets_list else -1)
-                dataset = dataset.filter(
-                    lambda encoder_input, decoder_target, encoder_target, s_id:
-                        tf.not_equal(decoder_target[0], OOV_id))
-            ######
+            # # filter out words not in the decoder_targets_list
+            # ######
+            # # FIX ME
+            # if False:  # not self.TARGETS_ARE_SEQUENCES:
+            #     OOV_id = (decoder_targets_list.index(self.OOV_token)
+            #               if self.OOV_token in decoder_targets_list else -1)
+            #     dataset = dataset.filter(
+            #         lambda encoder_input, decoder_target, encoder_target, s_id:
+            #             tf.not_equal(decoder_target[0], OOV_id))
+            # ######
 
             # discard some of the data?; shuffle; batch (evening out w/padding)
             if num_shards_to_discard > 0:
@@ -1894,19 +1912,21 @@ class SequenceNetwork:
         return learning_rate
 
     def restore_and_assess(
-        self, unique_targets_list, subnets_params, restore_epoch,
-        WRITE=True, **graph_kwargs
+        self, subnets_params, restore_epoch, WRITE=True, **graph_kwargs
     ):
 
         ######
         # This code is redundant with fit above....
         # You *could* just construct the GraphBuilder once in the constructor
         assessment_subnet_params = subnets_params[-1]
+        decoder_targets_list = assessment_subnet_params.data_manifests[
+            'decoder_targets'].get_feature_list()
 
         def assessment_data_fxn(num_epochs):
             (data_op_tuple, misc_op_tuple, assessments
              ) = self._generate_oneshot_datasets(
-                unique_targets_list, assessment_subnet_params, num_epochs)
+                assessment_subnet_params, num_epochs
+            )
 
             if not WRITE:
                 for assessment in assessments.values():
@@ -1917,18 +1937,18 @@ class SequenceNetwork:
         @tfmpl.figure_tensor
         def plotting_fxn(confusions):
             fig = toolbox.draw_confusion_matrix(
-                confusions, unique_targets_list, (12, 12))
+                confusions, decoder_targets_list, (12, 12))
             return fig
 
         def assessment_net_builder(GPU_op_dict, CPU_op_dict):
             return self._build_assessment_net(
                 GPU_op_dict, CPU_op_dict, assessment_subnet_params,
-                unique_targets_list, self._standard_indexer, plotting_fxn)
+                decoder_targets_list, self._standard_indexer, plotting_fxn)
 
         def assessor(sess, assessment_struct, epoch, assessment_step, data_partition):
             return self._assess(
                 sess, assessment_struct, epoch, assessment_step,
-                unique_targets_list, data_partition)
+                decoder_targets_list, data_partition)
         ######
 
         # (re-)build the assessment graph and restore its params from the ckpt
