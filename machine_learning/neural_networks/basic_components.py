@@ -36,10 +36,16 @@ def tf_matmul_wrapper(
         USE_BIASES=True):
     wts_shape = (Nout, Nin) if transpose_b else (Nin, Nout)
     wts = create_weights(wts_shape, stiffness=stiffness, num_shards=num_shards)
-    if (common_layers.shape_list(inputs)[-1] == 1) and (Nin != 1):
-        # Shortcut notation: the inputs may be indices in lieu of a one-hot
-        #  representation.  In that case, rather than tf.matmul'ing by the
-        #  weight matrix, just extract the indexed column with tf.gather.
+
+    # This is something of a hack: When the inputs are integers, interpret them
+    #  as indices--in lieu of a one-hot representation--and therefore tf.gather
+    #  to extract the indexed column, rather than tf.matmul.
+    # You would prefer to test sizes, but this is impossible:  You need to hide
+    #  the final dimension (num_features) from Tensorflow to keep it from
+    #  noticing that different subjects have different num_features (which is
+    #  fine, because they're separated by tf.case, but TF doesn't get this).
+    #### if (common_layers.shape_list(inputs)[-1] == 1) and (Nin != 1):
+    if inputs.dtype is tf.int32:
         return tf.gather(wts, tf.reshape(inputs, [-1]))
     else:
         return tf.matmul(inputs, wts, transpose_b=transpose_b)

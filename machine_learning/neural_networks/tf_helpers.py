@@ -377,7 +377,8 @@ def get_session_and_saver(
     if initialize_graph is None:
         initialize_graph = tf.group(
             tf.compat.v1.global_variables_initializer(),
-            tf.compat.v1.local_variables_initializer())
+            tf.compat.v1.local_variables_initializer()
+        )
 
     # create a session
     sess_config = tf.compat.v1.ConfigProto(

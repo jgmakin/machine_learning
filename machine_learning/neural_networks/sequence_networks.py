@@ -958,10 +958,9 @@ class SequenceNetwork:
         num_encoder_input_features = params.data_manifests[
             'encoder_inputs'].num_features
         desequenced_op_dict = dict(desequenced_op_dict)
+        subscope = 'subnet_{}'.format(net_id)
 
-        with tf.compat.v1.variable_scope(
-            'subnet_{}'.format(net_id), reuse=tf.compat.v1.AUTO_REUSE
-        ):
+        with tf.compat.v1.variable_scope(subscope, reuse=tf.compat.v1.AUTO_REUSE):
             # reverse (a la Sutskever2014)
             _, get_lengths = nn.sequences_tools(tfh.hide_shape(get_encoder_inputs))
             reverse_encoder_inputs = tf.reverse_sequence(
@@ -997,9 +996,6 @@ class SequenceNetwork:
                     'encoder_embedding')
 
         # push thru an RNN whose states will *not* be passed to the decoder?
-        ######
-        # It's vaguely possible that this would work without the "if/else"
-        ######
         if len(self.layer_sizes['preencoder_rnn']) > 0:
             # provide training targets for the encoder?
             get_encoder_RNN_inputs, _ = nn.LSTM_rnn(
@@ -1011,9 +1007,7 @@ class SequenceNetwork:
             get_encoder_RNN_inputs = embed_reversed_inputs
 
         # impose penalties on the "preencoder_RNN_outputs"?
-        with tf.compat.v1.variable_scope(
-            'subnet_{}'.format(net_id), reuse=tf.compat.v1.AUTO_REUSE
-        ):
+        with tf.compat.v1.variable_scope(subscope, reuse=tf.compat.v1.AUTO_REUSE):
             for key, data_manifest in params.data_manifests.items():
                 # For any key containing 'encoder_targets', construct an output
                 #  net with layer sizes given by the corresponding
@@ -1829,7 +1823,8 @@ class SequenceNetwork:
             # ...
             dataset = tf.data.TFRecordDataset([
                 subnet_params.tf_record_partial_path.format(block_id)
-                for block_id in subnet_params.block_ids[data_partition]])
+                for block_id in subnet_params.block_ids[data_partition]]
+            )
             dataset = dataset.map(
                 lambda example_proto: tfh.parse_protobuf_seq2seq_example(
                     example_proto, subnet_params.data_manifests
