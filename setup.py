@@ -24,10 +24,10 @@ setuptools.setup(
     install_requires=[
         'numpy',
         'scipy',
-        'tensor2tensor==1.14.1',
+        'tensor2tensor==1.15.4',
         'tensorflow-probability>=0.7',
         'tfmpl',
         'protobuf>=3.7',
-        # 'tensorflow-gpu==1.14'
+        # 'tensorflow-gpu==1.15.2'  the cpu version will also work
     ],
 )
