@@ -21,8 +21,8 @@ import tfmpl
 # local
 from utils_jgm import toolbox
 from utils_jgm.machine_compatibility_utils import MachineCompatibilityUtils
-from . import basic_components as nn
-from . import tf_helpers as tfh
+from machine_learning.neural_networks import basic_components as nn
+from machine_learning.neural_networks import tf_helpers as tfh
 
 MCUs = MachineCompatibilityUtils()
 
@@ -48,6 +48,8 @@ all_assessment_ops = [
     "sequenced_decoder_outputs",
     'desequenced_encoder_targets',
     'desequenced_encoder_natural_params',
+    'desequenced_decoder_targets',
+    'desequenced_decoder_natural_params',
 ]
 
 
@@ -482,7 +484,7 @@ class SequenceNetwork:
     ):
 
         # ENCODER
-        (final_RNN_state, desequenced_op_dict, stride,
+        (get_RNN_outputs, get_final_RNN_state, desequenced_op_dict, stride,
          draw_initial_ind, _) = self._encode_sequences(
             sequenced_op_dict['encoder_inputs'], subnet_params,
             self.FF_dropout, self.RNN_dropout, tower_name=tower_name)
@@ -494,11 +496,15 @@ class SequenceNetwork:
         # DECODER
         if self.TARGETS_ARE_SEQUENCES:
             desequenced_op_dict = self._decode_training_sequences(
-                final_RNN_state, sequenced_op_dict['decoder_targets'],
-                subnet_params, eos_id, desequenced_op_dict)
+                get_RNN_outputs, get_final_RNN_state,
+                sequenced_op_dict['decoder_targets'], subnet_params, eos_id,
+                desequenced_op_dict)
         else:
+            ################
+            # You could add the attention mechanism here, using get_RNN_outputs
+            ################
             desequenced_op_dict['decoder_natural_params'] = self._output_net(
-                final_RNN_state[-1].h, self.layer_sizes['decoder_rnn'][-1],
+                get_final_RNN_state[-1].h, self.layer_sizes['decoder_rnn'][-1],
                 self.layer_sizes['decoder_projection'],
                 subnet_params.data_manifests['decoder_targets'].num_features,
                 self.FF_dropout,
@@ -513,7 +519,7 @@ class SequenceNetwork:
         self._accumulate_cross_entropy_loss(desequenced_op_dict, subnet_params)
         ######
 
-        return final_RNN_state
+        return get_final_RNN_state
 
         ##########
     def save_prediction_graph(
@@ -668,7 +674,7 @@ class SequenceNetwork:
             ):
 
                 # encode decimated sequence starting at initial_ind
-                (get_final_state, desequenced_op_dict, _, _,
+                (_, get_final_state, desequenced_op_dict, _, _,
                  index_decimated_sequences) = self._encode_sequences(
                     sequenced_op_dict['encoder_inputs'], params, 0.0, 0.0,
                     desequenced_op_dict, initial_ind_op)
@@ -771,7 +777,7 @@ class SequenceNetwork:
             ):
 
                 # encode
-                (get_final_state, desequenced_op_dict, _, _,
+                (_, get_final_state, desequenced_op_dict, _, _,
                  index_decimated_sequences) = self._encode_sequences(
                     sequenced_op_dict['encoder_inputs'], params, 0.0, 0.0,
                     desequenced_op_dict, initial_ind_op)
@@ -1035,13 +1041,15 @@ class SequenceNetwork:
                     )
 
         # the encoder LSTM whose states will be passed to the decoder
-        _, get_final_RNN_state = nn.LSTM_rnn(
+        get_RNN_outputs, get_final_RNN_state = nn.LSTM_rnn(
             get_encoder_RNN_inputs, get_decimated_lengths,
             self.layer_sizes['encoder_rnn'], RNN_dropout, 'encoder_rnn',
             BIDIRECTIONAL=self.ENCODER_RNN_IS_BIDIRECTIONAL)
 
-        return (get_final_RNN_state, desequenced_op_dict, stride,
-                set_initial_ind, index_decimated_sequences)
+        return (
+            get_RNN_outputs, get_final_RNN_state, desequenced_op_dict,
+            stride, set_initial_ind, index_decimated_sequences
+        )
 
     def _convolve_sequences(
         self, sequences, total_stride, num_features, layer_sizes,
@@ -1120,11 +1128,11 @@ class SequenceNetwork:
         return desequenced_op_dict
 
     def _decode_training_sequences(
-        self, final_encoder_state, get_targets, subnet_params, eos_id,
-        desequenced_op_dict=()
+        self, get_encoder_outputs, get_final_encoder_state, get_targets,
+        subnet_params, eos_id, desequenced_op_dict=()
     ):
         '''
-        Initialize an RNN at the final_encoder_state, run on the targets,
+        Initialize an RNN at the get_final_encoder_state, run on the targets,
         right-shifted by one (so the first entry is an EOS), and collect up the
         desequenced outputs, get_decoder_natural_params, for all time steps.
         NB that the targets are *not* used here to take the sample average in
@@ -1142,7 +1150,7 @@ class SequenceNetwork:
         desequenced_op_dict = dict(desequenced_op_dict)
         index_sequences_elements, get_sequences_lengths = nn.sequences_tools(
             get_targets)
-        Nsequences = common_layers.shape_list(final_encoder_state[-1].h)[0]
+        Nsequences = common_layers.shape_list(get_final_encoder_state[-1].h)[0]
         initial_ids = tf.fill([Nsequences, 1, 1], eos_id)
 
         # embed input sequences; pass thru RNN; de-sequence outputs
@@ -1157,7 +1165,7 @@ class SequenceNetwork:
         get_RNN_outputs, _ = nn.LSTM_rnn(
             tf.cast(embed_output_sequences, tf.float32), get_sequences_lengths,
             self.layer_sizes['decoder_rnn'], self.RNN_dropout, 'decoder_rnn',
-            initial_state=final_encoder_state)
+            initial_state=get_final_encoder_state)
         desequence_RNN_outputs = tf.gather_nd(
             get_RNN_outputs, index_sequences_elements)
         desequenced_op_dict['decoder_natural_params'] = self._output_net(
@@ -1321,6 +1329,58 @@ class SequenceNetwork:
 
         return resequence_embedded_sequences
 
+    def Bahdanau_attention(self, get_query, get_values, FF_dropout):
+        '''
+        query: the decoder's [[top-layer??]] hidden-unit activity at every step
+        values: the output of the encoder at every step of the sequence
+        '''
+
+        #######
+        # You need to desequence and re-sequence first
+        # You probably want to move this into basic_components
+        #######
+
+        # pass each of the query and values pass through one-layer
+        get_query, Ndims_query = nn.feed_forward_multi_layer(
+            get_query,
+            Ninputs,
+            self.layer_sizes['decoder_rnn'][-1],
+            FF_dropout,
+            'attention',
+            preactivation_fxns=[self._vanilla_affine_fxn]
+        )
+        get_values, Ndims_values = nn.feed_forward_multi_layer(
+            get_values,
+            Ninputs,
+            self.layer_sizes['encoder_rnn'][-1],
+            FF_dropout,
+            'attention',
+            preactivation_fxns=[self._vanilla_affine_fxn]
+        )
+
+        ############################
+        ############################
+        self.V = tf.keras.layers.Dense(1)
+
+        # (batch_size, hidden size) -> (batch_size, 1, hidden size)
+        query_with_time_axis = tf.expand_dims(query, 1)
+
+        # (batch_size, max_length, units)
+        prescore = tf.nn.tanh(self.W1(query_with_time_axis) + self.W2(values))
+        # (batch_size, max_length, 1)
+        score = self.V(prescore)
+
+        # (batch_size, max_length, 1)
+        get_attention = tf.nn.softmax(score, axis=1)
+
+        # (batch_size, hidden_size)
+        get_context = tf.reduce_sum(get_attention*values, axis=1)
+
+        return get_context, get_attention
+        ############################
+        ############################
+
+
     # CURRENTLY DEPRECATED
     def _sequence_dilate(
         self, sequences, emb_layer_sizes, FF_dropout, emb_strings,
@@ -1420,8 +1480,9 @@ class SequenceNetwork:
         predict_top_k_inds = tf.identity(
             predict_top_k_inds, name='assess_top_k_inds')
         assess_accuracies = tf.cast(tf.equal(
-            predict_top_k_inds, desequenced_op_dict['decoder_targets']), tf.float32)
-        average_accuracies = tf.reduce_mean(input_tensor=assess_accuracies, axis=0)
+            predict_top_k_inds, desequenced_op_dict['decoder_targets']
+        ), tf.float32)
+        average_accuracies = tf.reduce_mean(assess_accuracies, axis=0)
         if 'top_%i_accuracy' % self.k_for_top_k_accuracy in self.summary_op_set:
             tf.compat.v1.summary.scalar(
                 'summarize_top_%i_accuracy' % self.k_for_top_k_accuracy,
@@ -1819,8 +1880,6 @@ class SequenceNetwork:
         # accumulate datasets, one for each subnetwork
         dataset_list = []
         for subnet_params in subnets_params:
-
-            # ...
             dataset = tf.data.TFRecordDataset([
                 subnet_params.tf_record_partial_path.format(block_id)
                 for block_id in subnet_params.block_ids[data_partition]]
@@ -1828,8 +1887,14 @@ class SequenceNetwork:
             dataset = dataset.map(
                 lambda example_proto: tfh.parse_protobuf_seq2seq_example(
                     example_proto, subnet_params.data_manifests
-                ), num_parallel_calls=32
+                ),
+                num_parallel_calls=32
             )
+            #########
+            # Insane tensorflow bug: "num_parallel_calls" cannot be moved to
+            #  the preceding line (after the comma), and results in extremely
+            #  erratic behavior (especially in conjunction with Jupyter)
+            #########
 
             # filter data to include or exclude only specified decoder targets?
             decoder_targets_list = subnet_params.data_manifests[
@@ -1884,8 +1949,9 @@ class SequenceNetwork:
             dataset_list.append(dataset)
 
         # (randomly) interleave (sub-)batches w/o throwing anything away
-        dataset = reduce(lambda set_a, set_b: set_a.concatenate(set_b),
-                         dataset_list)
+        dataset = reduce(
+            lambda set_a, set_b: set_a.concatenate(set_b), dataset_list
+        )
         dataset = dataset.shuffle(buffer_size=3000)
 
         return dataset
@@ -2110,7 +2176,7 @@ class TargetFilter:
 def data_augmentor(sequenced_op_dict, keyword):
     ######
     # This has a bunch of values hard-coded in--including the booleans that
-    #  control whether or not something happens.  At some future data you
+    #  control whether or not something happens.  At some future date you
     #  might generalize it.
     ######
 

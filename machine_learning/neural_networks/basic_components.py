@@ -163,8 +163,10 @@ def create_biases(bias_shape, stiffness=0):
     return biases
 
 
-def LSTM_rnn(batch_sequences, sequence_lengths, hidden_layer_sizes,
-             dropout, name, initial_state=None, BIDIRECTIONAL=False):
+def LSTM_rnn(
+    batch_sequences, sequence_lengths, hidden_layer_sizes, dropout, name,
+    initial_state=None, BIDIRECTIONAL=False
+):
     # Borrowed from the tensor2tensor library, and modified
     '''
     Run LSTM cell on inputs, assuming they have size
@@ -178,7 +180,7 @@ def LSTM_rnn(batch_sequences, sequence_lengths, hidden_layer_sizes,
     num_hidden_layers:
     dropout:
     name:
-    initial_state:
+    states:
 
     Outputs:
     -------
@@ -220,7 +222,7 @@ def LSTM_rnn(batch_sequences, sequence_lengths, hidden_layer_sizes,
         if BIDIRECTIONAL:
             ### This is messed up b/c the initial state could be for multiple
             ###  layers
-            layers = [tf.keras.layers.Bidirectional(layer, initial_state)
+            layers = [tf.keras.layers.Bidirectional(layer, states)
                       for layer in layers]
         stacked_layers = tf.keras.layers.StackedRNNCells(layers)
         masked_sequences = tf.keras.layers.Masking()(batch_sequences)
@@ -236,11 +238,15 @@ def LSTM_rnn(batch_sequences, sequence_lengths, hidden_layer_sizes,
             input_keep_prob=1-dropout,
         )
     with tf.compat.v1.variable_scope(name, reuse=tf.compat.v1.AUTO_REUSE):
-        forward_layers = [variational_dropout_lstm_cell(layer_size)
-                          for layer_size in hidden_layer_sizes]
         if BIDIRECTIONAL:
-            backward_layers = [variational_dropout_lstm_cell(layer_size)
-                               for layer_size in hidden_layer_sizes]
+            forward_layers = [
+                variational_dropout_lstm_cell(layer_size)
+                for layer_size in hidden_layer_sizes
+            ]
+            backward_layers = [
+                variational_dropout_lstm_cell(layer_size)
+                for layer_size in hidden_layer_sizes
+            ]
 
             # see https://stackoverflow.com/questions/49242266/
             (outputs, final_state_fw, final_state_bw
@@ -257,7 +263,52 @@ def LSTM_rnn(batch_sequences, sequence_lengths, hidden_layer_sizes,
                 tf.concat((state_fw.c, state_bw.c), 1),
                 tf.concat((state_fw.h, state_bw.h), 1))
                 for state_fw, state_bw in zip(final_state_fw, final_state_bw))
+
+            # ###########
+            # TF 2.x STYLE
+            #
+            # # But see this tensorflow stupidity:
+            # # https://github.com/tensorflow/tensorflow/issues/35654
+            # ###########
+
+            # # transform initial state into the new format
+            # outputs = tf.keras.layers.Masking(mask_value=0.0)(batch_sequences)
+            # if initial_state is None:
+            #     states = None
+            # else:
+            #     states = [
+            #         initial_state[-1].h[:, :hidden_layer_sizes[0]/2],
+            #         initial_state[-1].c[:, :hidden_layer_sizes[0]/2],
+            #         initial_state[-1].h[:, -hidden_layer_sizes[0]/2:],
+            #         initial_state[-1].c[:, -hidden_layer_sizes[0]/2:],
+            #     ]
+
+            # all_states = []
+            # for ii, layer_size in enumerate(hidden_layer_sizes):
+            #     outputs, *states = tf.keras.layers.Bidirectional(
+            #         tf.keras.layers.RNN(
+            #             tf.keras.layers.LSTMCell(
+            #                 layer_size, recurrent_dropout=dropout
+            #             ), return_state=True, return_sequences=True
+            #         )
+            #     )(outputs, states)
+
+            #     # accumulate the states, converting over to the old format
+            #     all_states.append(
+            #         tf.compat.v1.nn.rnn_cell.LSTMStateTuple(
+            #             tf.concat((states[1], states[3]), 1),
+            #             tf.concat((states[0], states[2]), 1)
+            #         )
+            #     )
+
+            # # probably unnecessary
+            # states_tuple = tuple(all_states)
+
         else:
+            forward_layers = [
+                variational_dropout_lstm_cell(layer_size)
+                for layer_size in hidden_layer_sizes
+            ]
             outputs, states_tuple = tf.compat.v1.nn.dynamic_rnn(
                 tf.compat.v1.nn.rnn_cell.MultiRNNCell(forward_layers),
                 batch_sequences,
@@ -567,8 +618,8 @@ def seq_log_probs_to_word_log_probs(
     each non-selected token at each time step *in each beam* can be assigned to
     exactly one of these non-selected sequences.  Hence e.g., even if token 324
     appears in at least one beam at time step t, it will still be assigned
-    probability p at t in all beams where it did *not* appear. This facilitates
-    summing log probabilities across the beams.
+    probability 1/S at t in all beams where it did *not* appear.  This
+    facilitates summing log probabilities across the beams.
 
     Total number of sequences: For simplicity, ignore the end-of-sequence
     tokens.  For a vocabulary of size N and a maximum sequence length of M,

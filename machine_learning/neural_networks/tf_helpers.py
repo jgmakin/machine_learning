@@ -159,7 +159,8 @@ class GraphBuilder:
             # set up trainer; open session; restore saved weights
             update_params, initialize_data, EMA = self._parallel_trainer()
             sess, saver = get_session_and_saver(
-                EMA=EMA, allow_soft_placement=True, allow_growth=True)
+                EMA=EMA, allow_soft_placement=True, allow_growth=True
+            )
             self._restore_weights(sess, training_graph, EMA)
             training_graph.finalize()
 
@@ -173,7 +174,7 @@ class GraphBuilder:
                 # The keys are EMA names; the values are EMA variables where
                 #  they exist and otherwise the "regular" variables. NB that it
                 #  includes the AdaM variables, although these are filtered out
-                #  below by requiring the vars be in reuse_vars.
+                #  below by requiring that the vars be in reuse_vars.
                 EMA_reuse_var_dict = EMA.variables_to_restore()
                 reuse_vars_dict = {EMA.average_name(var): EMA_reuse_var_dict[
                     EMA.average_name(var)] for var in reuse_vars}
