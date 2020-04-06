@@ -1329,58 +1329,6 @@ class SequenceNetwork:
 
         return resequence_embedded_sequences
 
-    def Bahdanau_attention(self, get_query, get_values, FF_dropout):
-        '''
-        query: the decoder's [[top-layer??]] hidden-unit activity at every step
-        values: the output of the encoder at every step of the sequence
-        '''
-
-        #######
-        # You need to desequence and re-sequence first
-        # You probably want to move this into basic_components
-        #######
-
-        # pass each of the query and values pass through one-layer
-        get_query, Ndims_query = nn.feed_forward_multi_layer(
-            get_query,
-            Ninputs,
-            self.layer_sizes['decoder_rnn'][-1],
-            FF_dropout,
-            'attention',
-            preactivation_fxns=[self._vanilla_affine_fxn]
-        )
-        get_values, Ndims_values = nn.feed_forward_multi_layer(
-            get_values,
-            Ninputs,
-            self.layer_sizes['encoder_rnn'][-1],
-            FF_dropout,
-            'attention',
-            preactivation_fxns=[self._vanilla_affine_fxn]
-        )
-
-        ############################
-        ############################
-        self.V = tf.keras.layers.Dense(1)
-
-        # (batch_size, hidden size) -> (batch_size, 1, hidden size)
-        query_with_time_axis = tf.expand_dims(query, 1)
-
-        # (batch_size, max_length, units)
-        prescore = tf.nn.tanh(self.W1(query_with_time_axis) + self.W2(values))
-        # (batch_size, max_length, 1)
-        score = self.V(prescore)
-
-        # (batch_size, max_length, 1)
-        get_attention = tf.nn.softmax(score, axis=1)
-
-        # (batch_size, hidden_size)
-        get_context = tf.reduce_sum(get_attention*values, axis=1)
-
-        return get_context, get_attention
-        ############################
-        ############################
-
-
     # CURRENTLY DEPRECATED
     def _sequence_dilate(
         self, sequences, emb_layer_sizes, FF_dropout, emb_strings,
@@ -1870,7 +1818,8 @@ class SequenceNetwork:
         return predicted_tokens
 
     def _tf_records_to_dataset(
-        self, subnets_params, data_partition, num_cases, num_shards_to_discard=0
+        self, subnets_params, data_partition, num_cases,
+        num_shards_to_discard=0, DROP_REMAINDER=False
     ):
         '''
         Load, shuffle, batch and pad, and concatentate across subnets (for
@@ -1927,6 +1876,7 @@ class SequenceNetwork:
                     key: data_manifest.padding_value
                     for key, data_manifest in subnet_params.data_manifests.items()
                 },
+                drop_remainder=DROP_REMAINDER
             )
 
             # add id for "proprietary" parts of network under transfer learning
