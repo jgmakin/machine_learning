@@ -43,13 +43,14 @@ all_assessment_ops = [
     'accuracy',
     'confusions',
     'top_k_inds',
+    #
     'decoder_sequence_log_probs',
-    'sequenced_decoder_targets',
-    "sequenced_decoder_outputs",
-    'desequenced_encoder_targets',
-    'desequenced_encoder_natural_params',
-    'desequenced_decoder_targets',
-    'desequenced_decoder_natural_params',
+    #
+    'decoder_targets',
+    'decoder_outputs',
+    'preencoder_targets',
+    'preencoder_natural_params',
+    #
 ]
 
 
@@ -148,20 +149,16 @@ class SequenceNetwork:
             'accuracy',
             'confusions',
             'top_k_inds',
+            # see all_assessment_ops for all possibilities
             'decoder_sequence_log_probs',
-            'sequenced_decoder_targets',
-            "sequenced_decoder_outputs",
-            ######
-            # FOR DEBUGGING PURPOSES ONLY
-            # 'desequenced_encoder_targets',
-            # 'desequenced_encoder_natural_params',
-            ######
+            'decoder_targets',
+            "decoder_outputs",
         },
         summary_op_set={
-            'accuracy',
             'word_error_rate',
-            'top_k_accuracy',
+            'accuracy',
             'confusions_image',
+            'top_k_accuracy',
             # 'xpct_normalized_accuracy',
             # 'vrnc_normalized_accuracy',
             # 'decoder_entropy',
@@ -356,7 +353,7 @@ class SequenceNetwork:
         def training_net_builder(GPU_op_dict, CPU_op_dict, tower_name):
 
             tf.transpose(a=GPU_op_dict['decoder_targets'], perm=[0, 2, 1],
-                         name='assess_sequenced_decoder_targets')
+                         name='assess_decoder_targets')
 
             total_loss, train_vars = self._build_training_net(
                 GPU_op_dict, CPU_op_dict, subnets_params,
@@ -371,7 +368,7 @@ class SequenceNetwork:
             return sess.run((
                 get_input_saliencies,
                 sess.graph.get_operation_by_name(
-                    'tower_0/assess_sequenced_decoder_targets').outputs[0]
+                    'tower_0/assess_decoder_targets').outputs[0]
                 ))
 
         def get_saliency_norms(sess, initializer, get_input_saliencies):
@@ -411,7 +408,7 @@ class SequenceNetwork:
                     per_example_norms, decoder_targets = sess.run((
                         get_per_example_norms,
                         sess.graph.get_operation_by_name(
-                            'tower_0/assess_sequenced_decoder_targets').outputs[0]
+                            'tower_0/assess_decoder_targets').outputs[0]
                     ))
                     all_per_example_norms = np.concatenate(
                         (all_per_example_norms, per_example_norms)
@@ -488,7 +485,7 @@ class SequenceNetwork:
          draw_initial_ind, _) = self._encode_sequences(
             sequenced_op_dict['encoder_inputs'], subnet_params,
             self.FF_dropout, self.RNN_dropout, tower_name=tower_name)
-        desequenced_op_dict = self._prepare_encoder_targets(
+        sequenced_op_dict, desequenced_op_dict = self._prepare_preencoder_targets(
                 sequenced_op_dict, draw_initial_ind, stride,
                 desequenced_op_dict
             )
@@ -516,7 +513,9 @@ class SequenceNetwork:
         # NB: Putting this in the if statement means a (nominally) different
         #  loss will be used for different subjects during *parallel* transfer
         #  learning.
-        self._accumulate_cross_entropy_loss(desequenced_op_dict, subnet_params)
+        self._accumulate_cross_entropy_loss(
+            sequenced_op_dict, desequenced_op_dict, subnet_params
+        )
         ######
 
         return get_final_RNN_state
@@ -575,8 +574,8 @@ class SequenceNetwork:
                             np.array([[[]]]), axes=[0, 2, 1]), tf.int32),
                         # Since this graph will be used only for inference
                         #  there's no point in saving the parts associated
-                        #  with encoder_targets, which are *auxiliary*.
-                        'encoder_targets': tf.cast([[[]]], tf.float32),
+                        #  with preencoder_targets, which are *auxiliary*.
+                        'preencoder_targets': tf.cast([[[]]], tf.float32),
                     },
                     {
                         'subnet_id': tf.constant(subnets_params[0].subnet_id)
@@ -587,7 +586,7 @@ class SequenceNetwork:
 
             # if no decoder_targets_list was passed...
             get_sequenced_decoder_outputs = tf.identity(
-                get_sequenced_decoder_outputs, name='sequenced_decoder_outputs')
+                get_sequenced_decoder_outputs, name='decoder_outputs')
             get_decoder_probs = tf.identity(
                 get_decoder_probs, name='decoder_probs')
 
@@ -603,7 +602,7 @@ class SequenceNetwork:
                 inputs={'encoder_inputs': place_encoder_inputs},
                 outputs={
                     "decoder_probs": get_decoder_probs,
-                    "sequenced_decoder_outputs": get_sequenced_decoder_outputs
+                    "decoder_outputs": get_sequenced_decoder_outputs
                 }
             )
 
@@ -625,7 +624,7 @@ class SequenceNetwork:
             # use the midpoint
             initial_initial_ind = 0  # stride//2
             num_loops = 1
-        desequenced_op_dict = self._prepare_encoder_targets(
+        sequenced_op_dict, desequenced_op_dict = self._prepare_preencoder_targets(
             sequenced_op_dict, initial_initial_ind, stride)
 
         if self.inputs_to_occlude:
@@ -746,6 +745,23 @@ class SequenceNetwork:
             desequenced_op_dict, decoder_targets_list, self.beam_width,
             self.pad_token)
 
+        # collect the *sequenced* *encoder* natural params, in case they're
+        #  useful for assessment
+        for key, desequenced_op in desequenced_natural_params_dict.items():
+            if 'preencoder_natural_params' in key:
+                # get the indiecs of the corresponding targets
+                t_key = key.replace('natural_params', 'targets')
+                index_encoder_targets, get_lengths = nn.sequences_tools(
+                    sequenced_op_dict[t_key]
+                )
+                resequenced_shape = [
+                    tf.shape(get_lengths)[0], tf.reduce_max(get_lengths),
+                    tf.shape(desequenced_op)[1]
+                ]
+                sequenced_op_dict[key] = tf.scatter_nd(
+                    index_encoder_targets, desequenced_op, resequenced_shape
+                )
+
         return sequenced_op_dict, desequenced_op_dict, decoder_sequence_log_probs
 
     def _assess_sequence_decoding(
@@ -753,12 +769,12 @@ class SequenceNetwork:
         decoder_targets_list, initial_initial_ind, num_loops, indexer
     ):
         # index the target sequences
-        index_sequences_elements, max_targ_length = indexer(
+        index_decoder_targets, max_targ_length = indexer(
             sequenced_op_dict['decoder_targets'])
 
         # desequence
         desequenced_op_dict['decoder_targets'] = tf.gather_nd(
-            sequenced_op_dict['decoder_targets'], index_sequences_elements)
+            sequenced_op_dict['decoder_targets'], index_decoder_targets)
 
         # if decimating, you'll need these to re-assemble the sequences
         index_consecutively = self._number_sequence_elements(
@@ -835,7 +851,7 @@ class SequenceNetwork:
                     tf.shape(op)[0], params.data_manifests[key].num_features
                 ], 0.0)
                 for key, op in desequenced_op_dict.items()
-                if 'encoder_targets' in key
+                if 'preencoder_targets' in key
             }
         ]
 
@@ -851,7 +867,7 @@ class SequenceNetwork:
                 key.replace('targets', 'natural_params'): tf.TensorShape([
                     None, params.data_manifests[key].num_features
                 ])
-                for key in desequenced_op_dict if 'encoder_targets' in key
+                for key in desequenced_op_dict if 'preencoder_targets' in key
             },
         ]
         ######
@@ -874,14 +890,31 @@ class SequenceNetwork:
                 sequenced_op_dict['decoder_outputs'],
                 decoder_sequence_log_probs,
                 params.data_manifests['decoder_targets'].num_features,
-                index_sequences_elements, max_targ_length,
+                index_decoder_targets, max_targ_length,
                 params.data_manifests['decoder_targets'].padding_value,
             )
 
         # (Ncases x max_ref_length x 1) -> (Ncases x 1 x max_ref_length)
         sequenced_op_dict['decoder_targets'] = tf.transpose(
             sequenced_op_dict['decoder_targets'], perm=[0, 2, 1],
-            name='assess_sequenced_decoder_targets')
+            name='assess_decoder_targets')
+
+        # collect the *sequenced* *encoder* natural params, in case they're
+        #  useful for assessment
+        for key, desequenced_op in desequenced_natural_params_dict.items():
+            if 'preencoder_natural_params' in key:
+                # get the indiecs of the corresponding targets
+                t_key = key.replace('natural_params', 'targets')
+                index_encoder_targets, get_lengths = nn.sequences_tools(
+                    sequenced_op_dict[t_key]
+                )
+                resequenced_shape = [
+                    tf.shape(get_lengths)[0], tf.reduce_max(get_lengths),
+                    tf.shape(desequenced_op)[1]
+                ]
+                sequenced_op_dict[key] = tf.scatter_nd(
+                    index_encoder_targets, desequenced_op, resequenced_shape
+                )
 
         return sequenced_op_dict, desequenced_op_dict, decoder_sequence_log_probs
 
@@ -930,7 +963,7 @@ class SequenceNetwork:
         '''
 
         for key, desequenced_op in desequenced_op_dict.items():
-            if 'encoder_natural_params' in key:
+            if 'preencoder_natural_params' in key:
                 if num_loops == 1:
                     desequenced_natural_params_dict[key] = desequenced_op
                 else:
@@ -943,10 +976,7 @@ class SequenceNetwork:
                         tf.shape(desequenced_natural_params_dict[key])
                     )
 
-        ######
-        # Is this even necessary??
         return desequenced_natural_params_dict
-        ######
 
     def _encode_sequences(
         self, get_encoder_inputs, params, FF_dropout, RNN_dropout,
@@ -1003,7 +1033,7 @@ class SequenceNetwork:
 
         # push thru an RNN whose states will *not* be passed to the decoder?
         if len(self.layer_sizes['preencoder_rnn']) > 0:
-            # provide training targets for the encoder?
+            # provide training targets for the preencoder?
             get_encoder_RNN_inputs, _ = nn.LSTM_rnn(
                 embed_reversed_inputs, get_decimated_lengths,
                 self.layer_sizes['preencoder_rnn'], RNN_dropout,
@@ -1015,11 +1045,11 @@ class SequenceNetwork:
         # impose penalties on the "preencoder_RNN_outputs"?
         with tf.compat.v1.variable_scope(subscope, reuse=tf.compat.v1.AUTO_REUSE):
             for key, data_manifest in params.data_manifests.items():
-                # For any key containing 'encoder_targets', construct an output
-                #  net with layer sizes given by the corresponding
-                #  'encoder_projection' entry in self.layer_sizes, targeting
-                #  the corresponding 'encoder_targets' in the data_manifests
-                if 'encoder_targets' in key:
+                # For any key containing 'preencoder_targets', construct an
+                #  output net with layer sizes given by the corresponding
+                #  'preencoder_projection' entry in self.layer_sizes, targeting
+                #  the corresponding 'preencoder_targets' in the data_manifests
+                if 'preencoder_targets' in key:
                     desequence_preencoder_RNN_outputs = tf.gather_nd(
                         get_encoder_RNN_inputs, index_decimated_sequences)
                     ######
@@ -1097,7 +1127,7 @@ class SequenceNetwork:
 
         return tf.squeeze(convolve_sequences, axis=1), set_initial_ind
 
-    def _prepare_encoder_targets(
+    def _prepare_preencoder_targets(
         self, sequenced_op_dict, draw_initial_ind, stride,
         desequenced_op_dict=()
     ):
@@ -1105,8 +1135,8 @@ class SequenceNetwork:
         # for each sequence type...
         desequenced_op_dict = dict(desequenced_op_dict)
         for key, sequenced_op in sequenced_op_dict.items():
-            # if it's an encoder_target...
-            if 'encoder_targets' in key:
+            # if it's a preencoder_target...
+            if 'preencoder_targets' in key:
 
                 # reverse (to match reversal of inputs), decimate, desequence
                 _, get_targets_lengths = nn.sequences_tools(sequenced_op)
@@ -1119,13 +1149,10 @@ class SequenceNetwork:
                 desequenced_op_dict[key] = tf.gather_nd(
                     decimate_targets, index_decimated_targets)
 
-                # for CTC
-                desequenced_op_dict[key.replace('targets', 'indices')] = \
-                    index_decimated_targets
-                desequenced_op_dict[key.replace('targets', 'length')] = \
-                    get_decimated_lengths
+                # NB: this overwrites the targets with their decimated version
+                sequenced_op_dict[key] = decimate_targets
 
-        return desequenced_op_dict
+        return sequenced_op_dict, desequenced_op_dict
 
     def _decode_training_sequences(
         self, get_encoder_outputs, get_final_encoder_state, get_targets,
@@ -1395,18 +1422,14 @@ class SequenceNetwork:
         self, sequenced_op_dict, desequenced_op_dict,
         decoder_sequence_log_probs, params, decoder_targets_list, plotting_fxn
     ):
-        # one can request any of the entries in either data dict
-        for dictionary, dict_name in [
-            (desequenced_op_dict, 'desequenced'),
-            (sequenced_op_dict, 'sequenced')
-        ]:
-            for op_key, op in dictionary.items():
-                assessment_key = dict_name + '_' + op_key
-                # if requested...
-                if assessment_key in self.assessment_op_set:
-                    # ...identify this operation for returning to the user
-                    dictionary[op_key] = tf.identity(
-                        op, name='assess_' + assessment_key)
+        # One can request any sequenced_op via the assessment_op_set--just make
+        #  sure it's also in the all_assessment_ops list
+        for op_key, sequenced_op in sequenced_op_dict.items():
+            # if requested...
+            if op_key in self.assessment_op_set:
+                # ...identify this operation for returning to the user
+                sequenced_op_dict[op_key] = tf.identity(
+                    sequenced_op, name='assess_' + op_key)
 
         # useful to have returned
         decoder_sequence_log_probs = tf.identity(
@@ -1417,7 +1440,8 @@ class SequenceNetwork:
         # <-log[q(outputs_d|inputs)]>_p(outputs_d,inputs),
         # <-log[q(outputs_e|inputs)]>_p(outputs_e,inputs)
         self._accumulate_cross_entropy_loss(
-            desequenced_op_dict, params, TRAINING=False)
+            sequenced_op_dict, desequenced_op_dict, params, TRAINING=False
+        )
 
         # top-k accuracy
         # \sum_i=1^k{<\delta{outputs_d - argmax_a[q(a|inputs)]}>_p(outputs_d,inputs)}
@@ -1543,7 +1567,7 @@ class SequenceNetwork:
             )
 
     def _accumulate_cross_entropy_loss(
-        self, desequenced_op_dict, subnet_params, TRAINING=True,
+        self, sequenced_op_dict, desequenced_op_dict, subnet_params, TRAINING=True,
     ):
 
         # apply to every *_target in the data_manifests
@@ -1559,45 +1583,27 @@ class SequenceNetwork:
                 if data_manifest.distribution == 'Gaussian':
                     # sum across features (axis=1)
                     compute_cross_entropy = tf.reduce_sum(
-                        input_tensor=tf.square(natural_params - targets),
-                        axis=1
-                    )/2
+                        tf.square(natural_params - targets), 1)/2
                 elif data_manifest.distribution == 'categorical':
                     compute_cross_entropy = tf.nn.sparse_softmax_cross_entropy_with_logits(
                         labels=tf.reshape(targets, [-1]), logits=natural_params)
                 elif data_manifest.distribution == 'CTC':
-                    # re-sequence targets and corresponding natural params
-                    index_targets = desequenced_op_dict[
-                        key.replace('targets', 'indices')]
-                    get_lengths = desequenced_op_dict[
-                        key.replace('targets', 'length')]
-                    sequenced_encoder_targets = tf.SparseTensor(
-                        tf.cast(index_targets, tf.int64),
-                        tf.reshape(targets, [-1]),
-                        tf.cast(
-                            [tf.shape(get_lengths)[0], tf.reduce_max(get_lengths)],
-                            tf.int64
-                        )
-                    )
-                    resequenced_shape = [
-                        tf.shape(get_lengths)[0], tf.reduce_max(get_lengths),
-                        tf.shape(natural_params)[1]
-                    ]
-                    sequenced_encoder_natural_params = tf.scatter_nd(
-                        index_targets, natural_params, resequenced_shape
-                    )
-                    sequenced_encoder_natural_params = tf.pad(
-                        sequenced_encoder_natural_params,
+                    #########
+                    # Why do we need to pad the symbol dimensions with a zero??
+                    sequenced_preencoder_natural_params = tf.pad(
+                        sequenced_op_dict[np_key],
                         tf.constant([[0, 0], [0, 0], [0, 1]])
                     )
+                    #########
+                    _, get_lengths = nn.sequences_tools(sequenced_op_dict[np_key])
 
                     ####
                     # ugh: not actually a cross entropy...
                     ####
                     compute_cross_entropy = tf.compat.v1.nn.ctc_loss(
-                        sequenced_encoder_targets,
+                        sequenced_op_dict[np_key],
                         sequence_length=get_lengths,
-                        inputs=sequenced_encoder_natural_params,
+                        inputs=sequenced_preencoder_natural_params,
                         preprocess_collapse_repeated=True,
                         ctc_merge_repeated=False,
                         time_major=False
@@ -1692,14 +1698,14 @@ class SequenceNetwork:
 
             if (
                 'decoder_sequence_log_probs' in self.assessment_op_set and
-                'sequenced_decoder_outputs' in self.assessment_op_set and
-                'sequenced_decoder_targets' in self.assessment_op_set
+                'decoder_outputs' in self.assessment_op_set and
+                'decoder_targets' in self.assessment_op_set
             ):
                 on_clr = 'on_yellow' if data_partition == 'training' else 'on_cyan'
 
                 # references
                 sequenced_decoder_target = self.target_inds_to_sequences(
-                    assessment_struct.sequenced_decoder_targets,
+                    assessment_struct.decoder_targets,
                     decoder_targets_list
                 )[0]
                 cprint('example ' + data_partition + ' reference:', on_color=on_clr)
@@ -1707,7 +1713,7 @@ class SequenceNetwork:
 
                 # hypotheses
                 sequenced_decoder_outputs = self.target_inds_to_sequences(
-                    assessment_struct.sequenced_decoder_outputs,
+                    assessment_struct.decoder_outputs,
                     decoder_targets_list
                 )
                 decoder_sequence_log_probs = assessment_struct.decoder_sequence_log_probs[0]
@@ -1721,13 +1727,13 @@ class SequenceNetwork:
                 print('')
 
                 # print *all* validation hypotheses and references
-                num_examples = assessment_struct.sequenced_decoder_outputs.shape[0]
+                num_examples = assessment_struct.decoder_outputs.shape[0]
                 for iExample in range(num_examples):
                     ref = self.target_inds_to_sequences(
-                        assessment_struct.sequenced_decoder_targets,
+                        assessment_struct.decoder_targets,
                         decoder_targets_list, iExample)[0]
                     hyp = self.target_inds_to_sequences(
-                        assessment_struct.sequenced_decoder_outputs,
+                        assessment_struct.decoder_outputs,
                         decoder_targets_list, iExample)[0]
                     cprint('{0:60} {1}'.format(ref, hyp), on_color='on_cyan')
                     if iExample > 50:
