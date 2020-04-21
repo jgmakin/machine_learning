@@ -392,7 +392,7 @@ def occlude_sequence_features(get_sequences, occluded_features):
 
 
 def tf_expected_word_error_rates(
-    sequence_data_op_dict, get_sequence_log_probs,
+    references, hypotheses, get_sequence_log_probs,
     USE_BUILTIN=True, EXCLUDE_EOS=False, eos_id=1
 ):
     '''
@@ -403,9 +403,8 @@ def tf_expected_word_error_rates(
 
     Input arguments:
     --------
-    sequence_data_op_dict: a dictionary that contains
-        'decoder_targets': (Ncases x 1 x max_ref_length)
-        'decoder_outputs': (Ncases x beam_width x max_hyp_length)
+    references: (Ncases x 1 x max_ref_length)
+    hypotheses: (Ncases x beam_width x max_hyp_length)
     get_sequence_log_probs': (Ncases x beam_width)
 
     For a categorical distribution, the natural params are (possibly
@@ -420,18 +419,15 @@ def tf_expected_word_error_rates(
     '''
 
     # Ns
-    Ncases = common_layers.shape_list(sequence_data_op_dict['decoder_targets'])[0]
-    beam_width = common_layers.shape_list(sequence_data_op_dict['decoder_outputs'])[1]
+    Ncases = common_layers.shape_list(references)[0]
+    beam_width = common_layers.shape_list(hypotheses)[1]
     N_sentences = Ncases*beam_width
 
     # tile references to have the same shape as hypotheses
     references = tf.reshape(
-        tf.tile(sequence_data_op_dict['decoder_targets'], [1, beam_width, 1]),
-        [N_sentences, -1]
+        tf.tile(references, [1, beam_width, 1]), [N_sentences, -1]
     )
-    hypotheses = tf.reshape(
-        sequence_data_op_dict['decoder_outputs'], [N_sentences, -1]
-    )
+    hypotheses = tf.reshape(hypotheses, [N_sentences, -1])
 
     # get word error rates
     get_word_error_rate = (tf_word_error_rates_built_in if USE_BUILTIN
@@ -674,25 +670,29 @@ def seq_log_probs_to_word_log_probs(
     # fill in zeros with (approximate) out-of-beam log probs (see above)
     out_beam_log_prob = tf.multiply(
         tf.cast(-max_targ_length, tf.float32),
-        tf.math.log(tf.cast(Nclasses, tf.float32)))
+        tf.math.log(tf.cast(Nclasses, tf.float32))
+    )
     out_beam_log_probs = tf.fill(
-        common_layers.shape_list(in_beam_log_probs), out_beam_log_prob)
+        common_layers.shape_list(in_beam_log_probs), out_beam_log_prob
+    )
     IS_OUT_OF_BEAM = tf.equal(in_beam_log_probs, 0)
     beam_log_probs = tf.compat.v1.where(
-        IS_OUT_OF_BEAM, out_beam_log_probs, in_beam_log_probs)
+        IS_OUT_OF_BEAM, out_beam_log_probs, in_beam_log_probs
+    )
 
     # collapse across beam -> (Ncases x max_targ_length x Nclasses)
     score_as_unnorm_log_probs = tf.reduce_logsumexp(beam_log_probs, axis=1)
 
     # de-sequence -> (sum_i^Ncases targ_seq_len(i) x Nclasses)
     score_as_unnorm_log_probs = tf.gather_nd(
-        score_as_unnorm_log_probs, index_sequences_elements)
+        score_as_unnorm_log_probs, index_sequences_elements
+    )
 
     return score_as_unnorm_log_probs
 
 
 def fake_beam_for_sequence_targets(
-    desequenced_op_dict, unique_targets_list, beam_width, pad_token
+    get_targets, get_natural_params, unique_targets_list, beam_width, pad_token
 ):
     '''
     This function breaks each target and prediction at any spaces they contain,
@@ -726,11 +726,9 @@ def fake_beam_for_sequence_targets(
         unique_tokens_list, shape=[1, 1, len(unique_tokens_list)])
 
     # pretend targets and predictions are themselves sequences
-    _, fake_beam_ids = tf.nn.top_k(
-        desequenced_op_dict['decoder_natural_params'], k=beam_width
-    )
+    _, fake_beam_ids = tf.nn.top_k(get_natural_params, k=beam_width)
     make_target_matrix = tf_sentence_to_word_ids(
-        desequenced_op_dict['decoder_targets'], unique_targets_tensor,
+        get_targets, unique_targets_tensor,
         unique_tokens_tensor, pad_token
     )
     make_prediction_matrix = tf_sentence_to_word_ids(
@@ -747,8 +745,7 @@ def fake_beam_for_sequence_targets(
     fake_beam_inds = tf.stack((tf.reshape(row_inds, [-1]),
                                tf.reshape(fake_beam_ids, [-1])), 1)
     fake_beam_natural_params = tf.reshape(
-        tf.gather_nd(desequenced_op_dict['decoder_natural_params'], fake_beam_inds),
-        [-1, beam_width]
+        tf.gather_nd(get_natural_params, fake_beam_inds), [-1, beam_width]
     )
 
     return references, hypotheses, fake_beam_natural_params
