@@ -43,6 +43,8 @@ all_assessment_ops = [
     'decoder_accuracy',
     'decoder_confusions',
     'decoder_top_k_inds',
+    'decoder_xpct_normalized_accuracy',
+    'decoder_vrnc_normalized_accuracy',
     #
     'decoder_sequence_log_probs',
     'decoder_targets',
@@ -73,10 +75,13 @@ def dual_violin_plot(
     # ax.axis('off')
     # ax.scatter(x, y)
     ax.violinplot(
-        dataset=[data[labels == label] for label in label_list
-                 if data[labels == label].shape[0]],
-        positions=[label for label in label_list
-                   if data[labels == label].shape[0]],
+        dataset=[
+            data[labels == label] for label in label_list
+            if data[labels == label].shape[0]
+        ],
+        positions=[
+            label for label in label_list if data[labels == label].shape[0]
+        ],
         showmeans=False, showmedians=True
     )
     ax.set_xlabel(x_axis_label)
@@ -163,11 +168,11 @@ class SequenceNetwork:
             'decoder_accuracy',
             'decoder_confusions_image',
             'decoder_top_k_accuracy',
-            # 'xpct_normalized_accuracy',
-            # 'vrnc_normalized_accuracy',
+            # 'decoder_xpct_normalized_accuracy',
+            # 'decoder_vrnc_normalized_accuracy',
             # 'decoder_entropy',
-            # 'calibration',
-            # 'calibration_image',
+            # 'decoder_calibration',
+            # 'decoder_calibration_image',
         },
         PROBABILISTIC_CONFUSIONS=False,
         inputs_to_occlude=None,
@@ -305,7 +310,7 @@ class SequenceNetwork:
         def assessment_net_builder(GPU_op_dict, CPU_op_dict):
             return self._build_assessment_net(
                 GPU_op_dict, CPU_op_dict, assessment_subnet_params,
-                decoder_targets_list, self._standard_indexer, plotting_fxn)
+                self._standard_indexer, plotting_fxn)
 
         def assessor(
             sess, assessment_struct, epoch, assessment_step, data_partition
@@ -500,7 +505,8 @@ class SequenceNetwork:
             else self._decode_training_tokens
         )
         sequenced_op_dict = decode_training_data(
-            sequenced_op_dict, get_final_RNN_state, subnet_params, eos_id
+            sequenced_op_dict, get_final_RNN_state, subnet_params,
+            self.FF_dropout, eos_id
         )
 
         ######
@@ -572,7 +578,7 @@ class SequenceNetwork:
                     {
                         'subnet_id': tf.constant(subnets_params[0].subnet_id)
                     },
-                    subnets_params[0], decoder_targets_list, indexing_fxn, None
+                    subnets_params[0], indexing_fxn, None
                 )
             get_decoder_probs = tf.nn.softmax(tf.reshape(
                 get_sequenced_natural_params, [-1, len(decoder_targets_list)]
@@ -601,8 +607,7 @@ class SequenceNetwork:
             )
 
     def _build_assessment_net(
-        self, sequenced_op_dict, CPU_op_dict, params, decoder_targets_list,
-        indexing_fxn, plotting_fxn
+        self, sequenced_op_dict, CPU_op_dict, params, indexing_fxn, plotting_fxn
     ):
 
         # identify for tensorboard
@@ -627,127 +632,34 @@ class SequenceNetwork:
                 sequenced_op_dict['encoder_inputs'], self.inputs_to_occlude)
 
         # create the sequence-classification neural network
-        decode_assessments = (
-            self._decode_assessment_sequences if self.TARGETS_ARE_SEQUENCES
-            else self._decode_assessment_tokens
-        )
-        sequenced_op_dict, decoder_sequence_log_probs = decode_assessments(
-            sequenced_op_dict, params, decoder_targets_list,
-            initial_initial_ind, num_loops, indexing_fxn
+        sequenced_op_dict = self._decode_assessments(
+            sequenced_op_dict, params, initial_initial_ind, num_loops,
+            indexing_fxn
         )
 
         # don't bother to write unless there is something to plot (??)
         if plotting_fxn is not None:
-            self._write_assessments(
-                sequenced_op_dict, decoder_sequence_log_probs, params,
-                decoder_targets_list, plotting_fxn
-            )
+            self._write_assessments(sequenced_op_dict, params, plotting_fxn)
 
         return (
             sequenced_op_dict['decoder_outputs'],
             sequenced_op_dict['decoder_natural_params']
         )
 
-    def _decode_assessment_tokens(
-        self, sequenced_op_dict, params, decoder_targets_list,
-        initial_initial_ind, num_loops, indexer
+    def _decode_assessments(
+        self, sequenced_op_dict, params, initial_initial_ind, num_loops, indexer
     ):
 
-        # ...
-        def loop_body(initial_ind_op, sequenced_natural_params_dict):
-            nonlocal sequenced_op_dict
+        # init
+        if self.TARGETS_ARE_SEQUENCES:
+            update_decoder_assessments = \
+                self._update_decoder_sequence_assessments
+            decode_assessments_core = self._decode_assessment_sequences
+        else:
+            update_decoder_assessments = \
+                self._update_decoder_token_assessments
+            decode_assessments_core = self._decode_assessment_tokens
 
-            with tf.compat.v1.variable_scope(
-                'seq2seq', reuse=tf.compat.v1.AUTO_REUSE
-            ):
-
-                # encode decimated sequence starting at initial_ind
-                sequenced_op_dict, get_final_state, _, _ = self._encode_sequences(
-                    sequenced_op_dict, params, 0.0, 0.0,
-                    set_initial_ind=initial_ind_op
-                )
-
-                # *fill in* the *encoder* natural params for each initial_ind
-                sequenced_natural_params_dict = self._fill_in_decimated_sequences(
-                    initial_ind_op, num_loops, sequenced_op_dict,
-                    sequenced_natural_params_dict
-                )
-
-                # *sum* the *decoder* natural params across all initial_inds
-                get_desequenced_natural_params = self._output_net(
-                    get_final_state[-1].h, self.layer_sizes['decoder_rnn'][-1],
-                    self.layer_sizes['decoder_projection'],
-                    params.data_manifests['decoder_targets'].num_features,
-                    0.0,
-                    final_preactivation=self._t2t_final_affine_fxn)
-                get_targets = sequenced_op_dict['decoder_targets']
-                index_elements, _ = nn.sequences_tools(get_targets)
-                sequenced_natural_params_dict['decoder_natural_params'] += \
-                    tf.scatter_nd(
-                        index_elements, get_desequenced_natural_params,
-                        [tf.shape(get_targets)[0], tf.shape(get_targets)[1],
-                         tf.shape(get_desequenced_natural_params)[-1]]
-                    )
-
-                # help out tf's shape-inference engine
-                for np_key, np_op in sequenced_natural_params_dict.items():
-                    # help out tf's shape-inference engine
-                    t_key = np_key.replace('natural_params', 'targets')
-                    np_op.set_shape(
-                        [None, None, params.data_manifests[t_key].num_features]
-                    )
-
-            return initial_ind_op+1, sequenced_natural_params_dict
-
-        # set up initial values and their shapes
-        initial_values = [
-            tf.constant(initial_initial_ind),
-            {
-                swap(key, 'natural_params'): tf.fill([
-                    tf.shape(op)[0], tf.shape(op)[1],
-                    params.data_manifests[key].num_features
-                ], 0.0)
-                for key, op in sequenced_op_dict.items() if '_targets' in key
-            },
-        ]
-        shape_invariants = [
-            tf.TensorShape([]),
-            {
-                swap(key, 'natural_params'): tf.TensorShape(
-                    [None, None, params.data_manifests[key].num_features]
-                ) for key, op in sequenced_op_dict.items() if '_targets' in key
-            },
-        ]
-
-        # loop
-        _, sequenced_natural_params_dict = tf.while_loop(
-            cond=lambda initial_ind, op_dict:
-                initial_ind < (initial_initial_ind+num_loops),
-            body=loop_body, loop_vars=initial_values,
-            shape_invariants=shape_invariants, back_prop=False
-        )
-
-        # combine these dictionaries
-        sequenced_op_dict = {
-            **sequenced_op_dict, **sequenced_natural_params_dict
-        }
-        sequenced_op_dict['decoder_natural_params'] /= num_loops
-
-        # Only does something interesting for 'trial' data
-        (sequenced_op_dict['decoder_beam_targets'],
-         sequenced_op_dict['decoder_outputs'],
-         decoder_sequence_log_probs) = nn.fake_beam_for_sequence_targets(
-            tf.squeeze(sequenced_op_dict['decoder_targets'], [1]),
-            tf.squeeze(sequenced_op_dict['decoder_natural_params'], [1]),
-            decoder_targets_list, self.beam_width, self.pad_token
-        )
-
-        return sequenced_op_dict, decoder_sequence_log_probs
-
-    def _decode_assessment_sequences(
-        self, sequenced_op_dict, params, decoder_targets_list,
-        initial_initial_ind, num_loops, indexer
-    ):
         # index the target sequences
         index_decoder_targets, max_targ_length = indexer(
             sequenced_op_dict['decoder_targets'])
@@ -776,33 +688,23 @@ class SequenceNetwork:
                     sequenced_natural_params_dict
                 )
 
-                # decode
-                (get_sequenced_decoder_outputs, get_decoder_sequence_log_probs
-                 ) = self._decode_assessment_sequences_core(
-                    get_final_state, sequenced_op_dict['decoder_targets'], params,
-                    decoder_targets_list, max_targ_length)
-
-                # As though the beam were (beam_width*temporal stride) wide
-                targ_length = tf.shape(get_sequenced_decoder_outputs)[2]
-                paddings = [[0, 0], [0, 0], [0, max_targ_length-targ_length]]
-                get_sequenced_decoder_outputs = tf.pad(
-                    tensor=get_sequenced_decoder_outputs, paddings=paddings,
-                    constant_values=params.data_manifests[
-                        'decoder_targets'].padding_value
+                # *accumulate* *decoder* natural params across all initial_inds
+                (sequenced_natural_params_dict,
+                 concatenate_sequenced_decoder_outputs,
+                 concatenate_decoder_sequence_log_probs
+                 ) = decode_assessments_core(
+                    params, get_final_state, max_targ_length,
+                    sequenced_op_dict, sequenced_natural_params_dict,
+                    concatenate_sequenced_decoder_outputs,
+                    concatenate_decoder_sequence_log_probs
                 )
-                concatenate_sequenced_decoder_outputs = tf.concat(
-                    (concatenate_sequenced_decoder_outputs,
-                     get_sequenced_decoder_outputs), axis=1)
-                concatenate_decoder_sequence_log_probs = tf.concat(
-                    (concatenate_decoder_sequence_log_probs,
-                     get_decoder_sequence_log_probs), axis=1)
 
                 # help out tf's shape-inference engine--doesn't seem like it
                 #  ought to be necessary but it is
-                for np_key, op in sequenced_natural_params_dict.items():
-                    key = np_key.replace('natural_params', 'targets')
-                    op.set_shape(
-                        [None, None, params.data_manifests[key].num_features]
+                for np_key, np_op in sequenced_natural_params_dict.items():
+                    t_key = np_key.replace('natural_params', 'targets')
+                    np_op.set_shape(
+                        [None, None, params.data_manifests[t_key].num_features]
                     )
 
                 return (
@@ -823,8 +725,7 @@ class SequenceNetwork:
                     tf.shape(op)[0], tf.shape(op)[1],
                     params.data_manifests[key].num_features
                 ], 0.0)
-                for key, op in sequenced_op_dict.items()
-                if 'preencoder_targets' in key
+                for key, op in sequenced_op_dict.items() if '_targets' in key
             }
         ]
         ######
@@ -839,14 +740,16 @@ class SequenceNetwork:
                 swap(key, 'natural_params'): tf.TensorShape([
                     None, None, params.data_manifests[key].num_features
                 ])
-                for key in sequenced_op_dict if 'preencoder_targets' in key
+                for key in sequenced_op_dict if '_targets' in key
             },
         ]
         ######
 
         # run the loop
-        (_, sequenced_op_dict['decoder_outputs'], decoder_sequence_log_probs,
-         sequenced_natural_params_dict) = tf.while_loop(
+        (_, sequenced_op_dict['decoder_outputs'],
+         sequenced_op_dict['decoder_sequence_log_probs'],
+         sequenced_natural_params_dict
+         ) = tf.while_loop(
             cond=lambda initial_ind, aa, bb, cc:
                 initial_ind < (initial_initial_ind+num_loops),
             body=loop_body, loop_vars=initial_values,
@@ -856,33 +759,83 @@ class SequenceNetwork:
             **sequenced_op_dict, **sequenced_natural_params_dict
         }
 
-        # convert: beam, sequence log probs -> token, all-word log probs
-        desequenced_decoder_natural_params = nn.seq_log_probs_to_word_log_probs(
-            sequenced_op_dict['decoder_outputs'],
-            decoder_sequence_log_probs,
-            params.data_manifests['decoder_targets'].num_features,
-            index_decoder_targets, max_targ_length,
-            params.data_manifests['decoder_targets'].padding_value,
+        # and now update the sequenced_op_dict
+        sequenced_op_dict = update_decoder_assessments(
+            sequenced_op_dict, params, index_decoder_targets, max_targ_length,
+            num_loops
         )
 
-        # resequence
-        get_targets = sequenced_op_dict['decoder_targets']
-        index_targets, _ = nn.sequences_tools(get_targets)
-        resequenced_shape = [
-            tf.shape(get_targets)[0], tf.shape(get_targets)[0],
-            tf.shape(desequenced_decoder_natural_params)[-1]
-        ]
-        sequenced_op_dict['decoder_natural_params'] = tf.scatter_nd(
-            index_targets, desequenced_decoder_natural_params, resequenced_shape
+        # If any preencoder targets are categorically distributed, collect
+        #   the tensors required to compute a word error rate.
+        for key, data_manifest in params.data_manifests.items():
+            if 'preencoder_targets' in key:
+                if data_manifest.distribution == 'categorical':
+                    # no beam search for the encoder (but see notes)
+                    sequenced_op_dict[swap(key, 'beam_targets')] = \
+                        tf.transpose(sequenced_op_dict[key], perm=[0, 2, 1])
+                    sequenced_op_dict[swap(key, 'outputs')] = tf.expand_dims(
+                        tf.argmax(
+                            sequenced_op_dict[swap(key, 'natural_params')],
+                            axis=2, output_type=tf.int32
+                        ), 1
+                    )
+                    sequenced_op_dict[swap(key, 'sequence_log_probs')] = \
+                        tf.fill([tf.shape(sequenced_op_dict[key])[0], 1], 0.0)
+
+        return sequenced_op_dict
+
+    def _decode_assessment_tokens(
+        self, params, get_final_state, max_targ_length, sequenced_op_dict,
+        sequenced_natural_params_dict,
+        concatenate_sequenced_decoder_outputs,
+        concatenate_decoder_sequence_log_probs
+    ):
+        # *sum* the *decoder* natural params across all initial_inds
+        sequenced_op_dict = self._decode_training_tokens(
+            sequenced_op_dict, get_final_state, params, 0.0, None
+        )
+        sequenced_natural_params_dict['decoder_natural_params'] += \
+            sequenced_op_dict['decoder_natural_params']
+
+        return (
+            sequenced_natural_params_dict,
+            concatenate_sequenced_decoder_outputs,
+            concatenate_decoder_sequence_log_probs
         )
 
-        # To facilitate printing:
-        #   (Ncases x max_ref_length x 1) -> (Ncases x 1 x max_ref_length)
-        sequenced_op_dict['decoder_beam_targets'] = tf.transpose(
-            sequenced_op_dict['decoder_targets'], perm=[0, 2, 1],
+    def _decode_assessment_sequences(
+        self, params, get_final_state, max_targ_length, sequenced_op_dict,
+        sequenced_natural_params_dict,
+        concatenate_sequenced_decoder_outputs,
+        concatenate_decoder_sequence_log_probs
+    ):
+        (get_sequenced_decoder_outputs, get_decoder_sequence_log_probs
+         ) = self._decode_assessment_sequences_core(
+            get_final_state, sequenced_op_dict['decoder_targets'], params,
+            params.data_manifests['decoder_targets'].get_feature_list(),
+            max_targ_length
         )
 
-        return sequenced_op_dict, decoder_sequence_log_probs
+        # as though the beam were (beam_width*temporal stride) wide
+        targ_length = tf.shape(get_sequenced_decoder_outputs)[2]
+        paddings = [[0, 0], [0, 0], [0, max_targ_length-targ_length]]
+        get_sequenced_decoder_outputs = tf.pad(
+            tensor=get_sequenced_decoder_outputs, paddings=paddings,
+            constant_values=params.data_manifests[
+                'decoder_targets'].padding_value
+        )
+        concatenate_sequenced_decoder_outputs = tf.concat(
+            (concatenate_sequenced_decoder_outputs,
+             get_sequenced_decoder_outputs), axis=1)
+        concatenate_decoder_sequence_log_probs = tf.concat(
+            (concatenate_decoder_sequence_log_probs,
+             get_decoder_sequence_log_probs), axis=1)
+
+        return (
+            sequenced_natural_params_dict,
+            concatenate_sequenced_decoder_outputs,
+            concatenate_decoder_sequence_log_probs
+        )
 
     def _decode_assessment_sequences_core(
         self, final_encoder_state, get_targets, subnet_params,
@@ -953,6 +906,57 @@ class SequenceNetwork:
 
         # outputs
         return get_sequenced_decoder_outputs, get_decoder_sequence_log_probs
+
+    def _update_decoder_token_assessments(
+        self, sequenced_op_dict, params, index_decoder_targets, max_targ_length,
+        num_loops
+    ):
+        sequenced_op_dict['decoder_natural_params'] /= num_loops
+
+        # Only does something interesting for 'trial' data
+        (sequenced_op_dict['decoder_beam_targets'],
+         sequenced_op_dict['decoder_outputs'],
+         sequenced_op_dict['decoder_sequence_log_probs']
+         ) = nn.fake_beam_for_sequence_targets(
+            tf.squeeze(sequenced_op_dict['decoder_targets'], [1]),
+            tf.squeeze(sequenced_op_dict['decoder_natural_params'], [1]),
+            params.data_manifests['decoder_targets'].get_feature_list(),
+            self.beam_width, self.pad_token
+        )
+
+        return sequenced_op_dict
+
+    def _update_decoder_sequence_assessments(
+        self, sequenced_op_dict, params, index_decoder_targets, max_targ_length,
+        num_loops
+    ):
+        # convert: beam, sequence log probs -> token, all-word log probs
+        desequenced_decoder_natural_params = nn.seq_log_probs_to_word_log_probs(
+            sequenced_op_dict['decoder_outputs'],
+            sequenced_op_dict['decoder_sequence_log_probs'],
+            params.data_manifests['decoder_targets'].num_features,
+            index_decoder_targets, max_targ_length,
+            params.data_manifests['decoder_targets'].padding_value,
+        )
+
+        # resequence
+        get_targets = sequenced_op_dict['decoder_targets']
+        index_targets, _ = nn.sequences_tools(get_targets)
+        resequenced_shape = [
+            tf.shape(get_targets)[0], tf.shape(get_targets)[0],
+            tf.shape(desequenced_decoder_natural_params)[-1]
+        ]
+        sequenced_op_dict['decoder_natural_params'] = tf.scatter_nd(
+            index_targets, desequenced_decoder_natural_params, resequenced_shape
+        )
+
+        # To facilitate printing:
+        #   (Ncases x max_ref_length x 1) -> (Ncases x 1 x max_ref_length)
+        sequenced_op_dict['decoder_beam_targets'] = tf.transpose(
+            sequenced_op_dict['decoder_targets'], perm=[0, 2, 1],
+        )
+
+        return sequenced_op_dict
 
     def _number_sequence_elements(self, get_sequences):
         '''
@@ -1223,7 +1227,8 @@ class SequenceNetwork:
         return sequenced_op_dict
 
     def _decode_training_tokens(
-        self, sequenced_op_dict, get_final_encoder_state, subnet_params, eos_id
+        self, sequenced_op_dict, get_final_encoder_state, subnet_params,
+        FF_dropout, eos_id
     ):
 
         # ...
@@ -1231,7 +1236,7 @@ class SequenceNetwork:
             get_final_encoder_state[-1].h, self.layer_sizes['decoder_rnn'][-1],
             self.layer_sizes['decoder_projection'],
             subnet_params.data_manifests['decoder_targets'].num_features,
-            self.FF_dropout, final_preactivation=self._t2t_final_affine_fxn
+            FF_dropout, final_preactivation=self._t2t_final_affine_fxn
         )
 
         # resequence
@@ -1246,7 +1251,8 @@ class SequenceNetwork:
         return sequenced_op_dict
 
     def _decode_training_sequences(
-        self, sequenced_op_dict, get_final_encoder_state, subnet_params, eos_id
+        self, sequenced_op_dict, get_final_encoder_state, subnet_params,
+        FF_dropout, eos_id
     ):
         '''
         Initialize an RNN at the get_final_encoder_state, run on the targets,
@@ -1276,7 +1282,7 @@ class SequenceNetwork:
         prev_targets = tf.concat((initial_ids, get_targets[:, :-1, :]), axis=1)
         embed_output_sequences = self._sequence_embed(
             prev_targets, targ_shapes, index_sequences_elements,
-            self.layer_sizes['decoder_embedding'], self.FF_dropout,
+            self.layer_sizes['decoder_embedding'], FF_dropout,
             'decoder_embedding',
             preactivation_fxn=self._t2t_embedding_affine_fxn)
         get_RNN_outputs, _ = nn.LSTM_rnn(
@@ -1290,7 +1296,7 @@ class SequenceNetwork:
             self.layer_sizes['decoder_rnn'][-1],
             self.layer_sizes['decoder_projection'],
             subnet_params.data_manifests['decoder_targets'].num_features,
-            self.FF_dropout,
+            FF_dropout,
             final_preactivation=self._t2t_final_affine_fxn
         )
 
@@ -1440,13 +1446,12 @@ class SequenceNetwork:
             transpose_b=True, num_shards=self.num_seq2seq_shards,
             USE_BIASES=self.BIAS_DECODER_OUTPUTS)
 
-    def _write_assessments(
-        self, sequenced_op_dict, decoder_sequence_log_probs, params,
-        decoder_targets_list, plotting_fxn
-    ):
+    def _write_assessments(self, sequenced_op_dict, params, plotting_fxn):
 
         ########
-        # loop over ['encoder', 'decoder']?
+        # The loop over data_manifests below could be pulled out to wrap just
+        #  about everything, including _accumulate_cross_entropy_loss, which
+        #  contains this loop internally...
         ########
 
         # <-log[q(outputs_d|inputs)]>_p(outputs_d,inputs),
@@ -1468,17 +1473,14 @@ class SequenceNetwork:
                 if data_manifest.distribution == 'categorical':
 
                     self._write_categorical_assessments(
-                        sequenced_op_dict, key, params,
-                        decoder_sequence_log_probs, decoder_targets_list,
-                        plotting_fxn
+                        key, sequenced_op_dict, params, plotting_fxn
                     )
 
     def _write_categorical_assessments(
-        self, sequenced_op_dict, key, params, decoder_sequence_log_probs,
-        decoder_targets_list, plotting_fxn
+        self, key, sequenced_op_dict, params, plotting_fxn
     ):
 
-        # ...
+        # gather some useful tensors
         sequenced_targets = sequenced_op_dict[key]
         sequenced_natural_params = sequenced_op_dict[swap(key, 'natural_params')]
         index_targets, _ = nn.sequences_tools(sequenced_targets)
@@ -1489,6 +1491,23 @@ class SequenceNetwork:
             sequenced_natural_params, index_targets
         )
 
+        # write assessents
+        assess_accuracies, predict_top_k_inds = self._write_accuracies(
+            key, desequenced_targets, desequenced_natural_params
+        )
+        self._write_word_error_rates(key, sequenced_op_dict, params)
+        confusions = self._write_confusions(
+            key, desequenced_targets, desequenced_natural_params,
+            predict_top_k_inds, params, plotting_fxn
+        )
+        self._write_frequency_normalized_stats(key, confusions)
+        self._write_calibration(
+            key, desequenced_natural_params, assess_accuracies, params
+        )
+
+    def _write_accuracies(
+        self, key, desequenced_targets, desequenced_natural_params
+    ):
         # top-k accuracy
         # \sum_i=1^k{<\delta{outputs_d - argmax_a[q(a|inputs)]}>_p(outputs_d,inputs)}
         _, predict_top_k_inds = tf.nn.top_k(
@@ -1518,122 +1537,153 @@ class SequenceNetwork:
                 'summarize_%s' % swap(key, 'accuracy'), assess_average_accuracy
             )
 
-        ####
-        # JUST FOR NOW do these only for the decoder....
-        ####
-        if key == 'decoder_targets':
-            sequenced_outputs = sequenced_op_dict[swap(key, 'outputs')]
-            sequenced_beam_targets = sequenced_op_dict[swap(key, 'beam_targets')]
+        return assess_accuracies, predict_top_k_inds
 
-            # minimum normalized edit distance between sequences of words
-            sequence_log_probs = tf.identity(
-                decoder_sequence_log_probs,
-                name='assess_%s' % swap(key, 'sequence_log_probs')
+    def _write_word_error_rates(self, key, sequenced_op_dict, params):
+
+        # the tensors required to compute a word error rate
+        sequenced_outputs = sequenced_op_dict[swap(key, 'outputs')]
+        sequenced_beam_targets = sequenced_op_dict[swap(key, 'beam_targets')]
+        sequence_log_probs = tf.identity(
+            sequenced_op_dict[swap(key, 'sequence_log_probs')],
+            name='assess_%s' % swap(key, 'sequence_log_probs')
+        )
+
+        # minimum normalized edit distance between sequences of words
+        targets_list = params.data_manifests[key].get_feature_list()
+        eos_id = (
+            targets_list.index(self.EOS_token)
+            if self.EOS_token in targets_list else -1
+        )
+        get_word_error_rates = nn.tf_expected_word_error_rates(
+            sequenced_beam_targets, sequenced_outputs, sequence_log_probs,
+            EXCLUDE_EOS=True, eos_id=eos_id
+        )
+        assess_word_error_rate = tf.reduce_mean(
+            input_tensor=get_word_error_rates,
+            name='assess_%s' % swap(key, 'word_error_rate')
+        )
+        ######
+        # FIX ME
+        # tf.compat.v1.get_collection('my_collection')
+        # tf.compat.v1.add_to_collection('my_collection', assess_word_error_rate)
+        # EMA = tf.train.ExponentialMovingAverage(decay=0.9)
+        # assess_word_error_rate = EMA.apply(tf.compat.v1.get_collection('my_collection'))
+        ######
+
+        if swap(key, 'word_error_rate') in self.summary_op_set:
+            tf.compat.v1.summary.scalar(
+                'summarize_%s' % swap(key, 'word_error_rate'),
+                assess_word_error_rate
             )
-            eos_id = (decoder_targets_list.index(self.EOS_token)
-                      if self.EOS_token in decoder_targets_list else -1)
-            get_word_error_rates = nn.tf_expected_word_error_rates(
-                sequenced_beam_targets, sequenced_outputs, sequence_log_probs,
-                EXCLUDE_EOS=True, eos_id=eos_id
+
+    def _write_confusions(
+        self, key, desequenced_targets, desequenced_natural_params,
+        predict_top_k_inds, params, plotting_fxn
+    ):
+        # tf's confusion matrix wants predictions, not probs.  Therefore,
+        #  you *prefer* to use your own version, using output *probabilities*.
+        num_target_features = params.data_manifests[key].num_features
+        if self.PROBABILISTIC_CONFUSIONS:
+            # the kind of confusion matrix, via conditional probabilities
+            qvec_samples = tf.nn.softmax(desequenced_natural_params)
+            xpct_pvec_qvec_unnorm = tf.scatter_nd(
+                desequenced_targets, qvec_samples,
+                tf.constant([num_target_features]*2, dtype=tf.int32))
+            xpct_pvec_unnorm = tf.reduce_sum(
+                input_tensor=xpct_pvec_qvec_unnorm, axis=1, keepdims=True)
+            confusions = tf.divide(
+                xpct_pvec_qvec_unnorm, xpct_pvec_unnorm,
+                name='assess_%s' % swap(key, 'confusions')
             )
-            assess_word_error_rate = tf.reduce_mean(
-                input_tensor=get_word_error_rates,
-                name='assess_%s' % swap(key, 'word_error_rate')
+        else:
+            # get confusions and supply a name to the op
+            confusions = tf.math.confusion_matrix(
+                labels=tf.reshape(desequenced_targets, [-1]),
+                predictions=predict_top_k_inds[:, 0],
+                num_classes=num_target_features)
+            confusions = tf.identity(
+                confusions, name='assess_%s' % swap(key, 'confusions')
             )
-            ######
-            # FIX ME
-            # tf.compat.v1.get_collection('my_collection')
-            # tf.compat.v1.add_to_collection('my_collection', assess_word_error_rate)
-            # EMA = tf.train.ExponentialMovingAverage(decay=0.9)
-            # assess_word_error_rate = EMA.apply(tf.compat.v1.get_collection('my_collection'))
-            ######
 
-            if swap(key, 'word_error_rate') in self.summary_op_set:
-                tf.compat.v1.summary.scalar(
-                    'summarize_%s' % swap(key, 'word_error_rate'),
-                    assess_word_error_rate
-                )
+        image_key = swap(key, 'confusions_image')
+        if image_key in self.summary_op_set:
+            tf.compat.v1.summary.image(
+                'summarize_%s' % image_key, plotting_fxn(confusions)
+            )
 
-            # tf's confusion matrix wants predictions, not probs.  Therefore,
-            #  you *prefer* to use your own version, using output *probabilities*.
-            num_decoder_target_features = params.data_manifests[
-                'decoder_targets'].num_features
-            if self.PROBABILISTIC_CONFUSIONS:
-                # the kind of confusion matrix, via conditional probabilities
-                qvec_samples = tf.nn.softmax(desequenced_natural_params)
-                xpct_pvec_qvec_unnorm = tf.scatter_nd(
-                    desequenced_targets, qvec_samples,
-                    tf.constant([num_decoder_target_features]*2, dtype=tf.int32))
-                xpct_pvec_unnorm = tf.reduce_sum(
-                    input_tensor=xpct_pvec_qvec_unnorm, axis=1, keepdims=True)
-                confusions = tf.divide(xpct_pvec_qvec_unnorm, xpct_pvec_unnorm,
-                                       name='assess_decoder_confusions')
-            else:
-                # get confusions and supply a name to the op
-                confusions = tf.math.confusion_matrix(
-                    labels=tf.reshape(desequenced_targets, [-1]),
-                    predictions=predict_top_k_inds[:, 0],
-                    num_classes=num_decoder_target_features)
-                confusions = tf.identity(
-                    confusions, name='assess_decoder_confusions'
-                )
+        return confusions
 
-            if 'decoder_confusions_image' in self.summary_op_set:
-                tf.compat.v1.summary.image(
-                    'summarize_decoder_confusions_image',
-                    plotting_fxn(confusions)
-                )
+    def _write_frequency_normalized_stats(self, key, confusions):
 
-            #############
-            # frequency-normalized accuracy--mean and variance
-            target_frequencies = tf.reduce_sum(input_tensor=confusions, axis=1)
-            where_targets = tf.cast(tf.compat.v1.where(target_frequencies > 0), tf.int32)
-            frequency_normalized_accuracies = tf.divide(
-                tf.gather(tf.linalg.diag_part(confusions), where_targets),
-                tf.gather(target_frequencies, where_targets))
-            assess_xpct_frequency_normalized_accuracy = tf.reduce_mean(
-                input_tensor=frequency_normalized_accuracies,
-                name='assess_xpct_normalized_accuracy')
-            if 'xpct_normalized_accuracy' in self.summary_op_set:
-                tf.compat.v1.summary.scalar(
-                    'summarize_xpct_normalized_accuracy',
-                    assess_xpct_frequency_normalized_accuracy
-                )
-            assess_vrnc_frequency_normalized_accuracy = tf.reduce_mean(
-                input_tensor=tf.math.squared_difference(
-                    frequency_normalized_accuracies,
-                    assess_xpct_frequency_normalized_accuracy),
-                name='assess_vrnc_normalized_accuracy')
-            if 'vrnc_normalized_accuracy' in self.summary_op_set:
-                tf.compat.v1.summary.scalar(
-                    'summarize_vrnc_normalized_accuracy',
-                    assess_vrnc_frequency_normalized_accuracy
-                )
-            #############
+        # EXPECTED frequency-normalized accuracy
+        xpct_key = swap(key, 'xpct_normalized_accuracy')
+        target_frequencies = tf.reduce_sum(input_tensor=confusions, axis=1)
+        where_targets = tf.cast(
+            tf.compat.v1.where(target_frequencies > 0), tf.int32
+        )
+        frequency_normalized_accuracies = tf.divide(
+            tf.gather(tf.linalg.diag_part(confusions), where_targets),
+            tf.gather(target_frequencies, where_targets))
+        assess_xpct_frequency_normalized_accuracy = tf.reduce_mean(
+            input_tensor=frequency_normalized_accuracies,
+            name='assess_%s' % xpct_key)
+        if xpct_key in self.summary_op_set:
+            tf.compat.v1.summary.scalar(
+                'summarize_%s' % xpct_key,
+                assess_xpct_frequency_normalized_accuracy
+            )
 
-            if 'decoder_entropy' in self.summary_op_set:
-                # the average entropy of the *decoder output distribution*
-                C = tf.reduce_logsumexp(desequenced_natural_params, axis=1)
-                decoder_probs = tf.nn.softmax(desequenced_natural_params)
-                assess_entropies = C - tf.reduce_sum(tf.multiply(
-                    decoder_probs, desequenced_natural_params), axis=1)
-                average_entropy = tf.reduce_mean(assess_entropies)
-                tf.compat.v1.summary.scalar(
-                    'summarize_decoder_entropy', np.log2(np.e)*average_entropy)
+        # VARIANCE of the frequency-normalized accuracy
+        vrnc_key = swap(key, 'vrnc_normalized_accuracy')
+        assess_vrnc_frequency_normalized_accuracy = tf.reduce_mean(
+            input_tensor=tf.math.squared_difference(
+                frequency_normalized_accuracies,
+                assess_xpct_frequency_normalized_accuracy
+            ),
+            name='assess_%s' % vrnc_key)
+        if vrnc_key in self.summary_op_set:
+            tf.compat.v1.summary.scalar(
+                'summarize_%s' % vrnc_key,
+                assess_vrnc_frequency_normalized_accuracy
+            )
 
-                # and does it correlate with accuracy?
-                acc_entropy_corr = tfp.stats.correlation(
-                    assess_accuracies[:, 0], assess_entropies, event_axis=None)
-                tf.compat.v1.summary.scalar(
-                    'summarize_calibration', acc_entropy_corr)
+    def _write_calibration(
+        self, key, desequenced_natural_params, assess_accuracies, params
+    ):
 
-                # also *look* at the relationship
-                tf.compat.v1.summary.image(
-                    'summarize_calibration_image', dual_violin_plot(
-                        assess_entropies, assess_accuracies[:, 0], [0, 1],
-                        x_axis_label='correctness', y_axis_label='decoder entropy',
-                        ymin=0.0, ymax=np.log2(num_decoder_target_features)),
-                )
+        # the average entropy of the *output distribution*
+        s_key = swap(key, 'entropy')
+        if s_key in self.summary_op_set:
+            C = tf.reduce_logsumexp(desequenced_natural_params, axis=1)
+            decoder_probs = tf.nn.softmax(desequenced_natural_params)
+            assess_entropies = C - tf.reduce_sum(tf.multiply(
+                decoder_probs, desequenced_natural_params), axis=1)
+            average_entropy = tf.reduce_mean(assess_entropies)
+            tf.compat.v1.summary.scalar(
+                'summarize_%s' % s_key, np.log2(np.e)*average_entropy
+            )
+        else:
+            return
+
+        # and does it correlate with accuracy?
+        s_key = swap(key, 'calibration')
+        if s_key in self.summary_op_set:
+            acc_entropy_corr = tfp.stats.correlation(
+                assess_accuracies[:, 0], assess_entropies, event_axis=None)
+            tf.compat.v1.summary.scalar(
+                'summarize_%s' % s_key, acc_entropy_corr
+            )
+
+        # also *look* at the relationship
+        s_key = swap(key, 'calibration_image')
+        if s_key in self.summary_op_set:
+            num_target_features = params.data_manifests[key].num_features
+            tf.compat.v1.summary.image(s_key, dual_violin_plot(
+                assess_entropies, assess_accuracies[:, 0], [0, 1],
+                x_axis_label='correctness', y_axis_label='entropy',
+                ymin=0.0, ymax=np.log2(num_target_features)
+            ))
 
     def _accumulate_cross_entropy_loss(
         self, sequenced_op_dict, subnet_params, TRAINING=True,
@@ -2047,7 +2097,8 @@ class SequenceNetwork:
         def assessment_net_builder(GPU_op_dict, CPU_op_dict):
             return self._build_assessment_net(
                 GPU_op_dict, CPU_op_dict, assessment_subnet_params,
-                decoder_targets_list, self._standard_indexer, plotting_fxn)
+                self._standard_indexer, plotting_fxn
+            )
 
         def assessor(sess, assessment_struct, epoch, assessment_step, data_partition):
             return self._assess(
