@@ -39,21 +39,21 @@ Created: July 2017
 '''
 
 all_assessment_ops = [
-    'decoder_word_error_rate',
-    'decoder_accuracy',
-    'decoder_confusions',
-    'decoder_top_k_inds',
-    'decoder_xpct_normalized_accuracy',
-    'decoder_vrnc_normalized_accuracy',
-    #
-    'decoder_sequence_log_probs',
-    'decoder_targets',
-    'decoder_beam_targets',
-    'decoder_outputs',
-    #
-    'preencoder_targets',
-    'preencoder_natural_params',
-    #
+    '%s_%s' % (coder, op_name) for coder in ['preencoder', 'decoder']
+    for op_name in [
+        'word_error_rate',
+        'accuracy',
+        'confusions',
+        'top_k_inds',
+        'xpct_normalized_accuracy',
+        'vrnc_normalized_accuracy',
+        #
+        'sequence_log_probs',
+        'targets',
+        'beam_targets',
+        'outputs',
+        'natural_params',
+    ]
 ]
 
 
@@ -513,7 +513,13 @@ class SequenceNetwork:
         # NB: Putting this in the if statement means a (nominally) different
         #  loss will be used for different subjects during *parallel* transfer
         #  learning.
-        self._accumulate_cross_entropy_loss(sequenced_op_dict, subnet_params)
+        ######
+        # apply to every *_target in the data_manifests
+        for t_key, data_manifest in subnet_params.data_manifests.items():
+            if '_targets' in t_key:
+                self._accumulate_cross_entropy_loss(
+                    t_key, data_manifest, sequenced_op_dict, subnet_params
+                )
         ######
 
         return get_final_RNN_state
@@ -653,11 +659,11 @@ class SequenceNetwork:
         # init
         if self.TARGETS_ARE_SEQUENCES:
             update_decoder_assessments = \
-                self._update_decoder_sequence_assessments
+                self._update_sequence_assessments
             decode_assessments_core = self._decode_assessment_sequences
         else:
             update_decoder_assessments = \
-                self._update_decoder_token_assessments
+                self._update_token_assessments
             decode_assessments_core = self._decode_assessment_tokens
 
         # index the target sequences
@@ -761,8 +767,8 @@ class SequenceNetwork:
 
         # and now update the sequenced_op_dict
         sequenced_op_dict = update_decoder_assessments(
-            sequenced_op_dict, params, index_decoder_targets, max_targ_length,
-            num_loops
+            'decoder_targets', sequenced_op_dict, params,
+            index_decoder_targets, max_targ_length, num_loops
         )
 
         # If any preencoder targets are categorically distributed, collect
@@ -907,53 +913,53 @@ class SequenceNetwork:
         # outputs
         return get_sequenced_decoder_outputs, get_decoder_sequence_log_probs
 
-    def _update_decoder_token_assessments(
-        self, sequenced_op_dict, params, index_decoder_targets, max_targ_length,
+    def _update_token_assessments(
+        self, key, sequenced_op_dict, params, index_targets, max_targ_length,
         num_loops
     ):
-        sequenced_op_dict['decoder_natural_params'] /= num_loops
+        sequenced_op_dict[swap(key, 'natural_params')] /= num_loops
 
         # Only does something interesting for 'trial' data
-        (sequenced_op_dict['decoder_beam_targets'],
-         sequenced_op_dict['decoder_outputs'],
-         sequenced_op_dict['decoder_sequence_log_probs']
+        (sequenced_op_dict[swap(key, 'beam_targets')],
+         sequenced_op_dict[swap(key, 'outputs')],
+         sequenced_op_dict[swap(key, 'sequence_log_probs')]
          ) = nn.fake_beam_for_sequence_targets(
-            tf.squeeze(sequenced_op_dict['decoder_targets'], [1]),
-            tf.squeeze(sequenced_op_dict['decoder_natural_params'], [1]),
-            params.data_manifests['decoder_targets'].get_feature_list(),
+            tf.squeeze(sequenced_op_dict[key], [1]),
+            tf.squeeze(sequenced_op_dict[swap(key, 'natural_params')], [1]),
+            params.data_manifests[key].get_feature_list(),
             self.beam_width, self.pad_token
         )
 
         return sequenced_op_dict
 
-    def _update_decoder_sequence_assessments(
-        self, sequenced_op_dict, params, index_decoder_targets, max_targ_length,
+    def _update_sequence_assessments(
+        self, key, sequenced_op_dict, params, index_targets, max_targ_length,
         num_loops
     ):
         # convert: beam, sequence log probs -> token, all-word log probs
-        desequenced_decoder_natural_params = nn.seq_log_probs_to_word_log_probs(
-            sequenced_op_dict['decoder_outputs'],
-            sequenced_op_dict['decoder_sequence_log_probs'],
-            params.data_manifests['decoder_targets'].num_features,
-            index_decoder_targets, max_targ_length,
-            params.data_manifests['decoder_targets'].padding_value,
+        desequenced_natural_params = nn.seq_log_probs_to_word_log_probs(
+            sequenced_op_dict[swap(key, 'outputs')],
+            sequenced_op_dict[swap(key, 'sequence_log_probs')],
+            params.data_manifests[key].num_features,
+            index_targets, max_targ_length,
+            params.data_manifests[key].padding_value,
         )
 
         # resequence
-        get_targets = sequenced_op_dict['decoder_targets']
+        get_targets = sequenced_op_dict[key]
         index_targets, _ = nn.sequences_tools(get_targets)
         resequenced_shape = [
             tf.shape(get_targets)[0], tf.shape(get_targets)[0],
-            tf.shape(desequenced_decoder_natural_params)[-1]
+            tf.shape(desequenced_natural_params)[-1]
         ]
-        sequenced_op_dict['decoder_natural_params'] = tf.scatter_nd(
-            index_targets, desequenced_decoder_natural_params, resequenced_shape
+        sequenced_op_dict[swap(key, 'natural_params')] = tf.scatter_nd(
+            index_targets, desequenced_natural_params, resequenced_shape
         )
 
         # To facilitate printing:
         #   (Ncases x max_ref_length x 1) -> (Ncases x 1 x max_ref_length)
-        sequenced_op_dict['decoder_beam_targets'] = tf.transpose(
-            sequenced_op_dict['decoder_targets'], perm=[0, 2, 1],
+        sequenced_op_dict[swap(key, 'beam_targets')] = tf.transpose(
+            sequenced_op_dict[key], perm=[0, 2, 1],
         )
 
         return sequenced_op_dict
@@ -1448,16 +1454,6 @@ class SequenceNetwork:
 
     def _write_assessments(self, sequenced_op_dict, params, plotting_fxn):
 
-        ########
-        # The loop over data_manifests below could be pulled out to wrap just
-        #  about everything, including _accumulate_cross_entropy_loss, which
-        #  contains this loop internally...
-        ########
-
-        # <-log[q(outputs_d|inputs)]>_p(outputs_d,inputs),
-        # <-log[q(outputs_e|inputs)]>_p(outputs_e,inputs)
-        self._accumulate_cross_entropy_loss(sequenced_op_dict, params, False)
-
         # One can request any sequenced_op via the assessment_op_set--just make
         #  sure it's also in the all_assessment_ops list
         for op_key, sequenced_op in sequenced_op_dict.items():
@@ -1465,13 +1461,21 @@ class SequenceNetwork:
             if op_key in self.assessment_op_set:
                 # ...identify this operation for returning to the user
                 sequenced_op_dict[op_key] = tf.identity(
-                    sequenced_op, name='assess_' + op_key)
+                    sequenced_op, name='assess_' + op_key
+                )
 
         # for sequences of categorical data
         for key, data_manifest in params.data_manifests.items():
             if '_targets' in key:
-                if data_manifest.distribution == 'categorical':
 
+                # <-log[q(outputs_d|inputs)]>_p(outputs_d,inputs),
+                # <-log[q(outputs_e|inputs)]>_p(outputs_e,inputs)
+                self._accumulate_cross_entropy_loss(
+                    key, data_manifest, sequenced_op_dict, params, False
+                )
+
+                # make some extra assessments of categorical data
+                if data_manifest.distribution == 'categorical':
                     self._write_categorical_assessments(
                         key, sequenced_op_dict, params, plotting_fxn
                     )
@@ -1689,104 +1693,105 @@ class SequenceNetwork:
             ))
 
     def _accumulate_cross_entropy_loss(
-        self, sequenced_op_dict, subnet_params, TRAINING=True,
+        self, key, data_manifest, sequenced_op_dict, subnet_params,
+        TRAINING=True,
     ):
 
-        # apply to every *_target in the data_manifests
-        for t_key, data_manifest in subnet_params.data_manifests.items():
-            if '_targets' in t_key:
+        # desequence the targets and natural_params
+        # NB that this enforces that the lengths of the predicted and
+        #  actual sequences match.  This is of course *not* enforced
+        #  when calculating the word error rate, which is done with the
+        #  'decoder_outputs', not 'decoder_natural_params'
+        index_encoder_targets, get_lengths = nn.sequences_tools(
+            sequenced_op_dict[key]
+        )
+        targets = tf.gather_nd(sequenced_op_dict[key], index_encoder_targets)
+        np_key = swap(key, 'natural_params')
+        natural_params = tf.gather_nd(
+            sequenced_op_dict[np_key], index_encoder_targets
+        )
 
-                # desequence the targets and natural_params
-                # NB that this enforces that the lengths of the predicted and
-                #  actual sequences match.  This is of course *not* enforced
-                #  when calculating the word error rate, which is done with the
-                #  'decoder_outputs', not 'decoder_natural_params'
-                index_encoder_targets, get_lengths = nn.sequences_tools(
-                    sequenced_op_dict[t_key]
+        # the form of the cross-entropy depends on the distribution
+        if data_manifest.distribution == 'Gaussian':
+            # sum across features (axis=1)
+            compute_cross_entropy = tf.reduce_sum(
+                tf.square(natural_params - targets), 1)/2
+        elif data_manifest.distribution == 'categorical':
+            compute_cross_entropy = tf.nn.sparse_softmax_cross_entropy_with_logits(
+                labels=tf.reshape(targets, [-1]), logits=natural_params
+            )
+        elif data_manifest.distribution == 'CTC':
+            #########
+            # Why do we need to pad the symbol dimensions with a zero??
+            sequenced_natural_params = tf.pad(
+                sequenced_op_dict[np_key],
+                tf.constant([[0, 0], [0, 0], [0, 1]])
+            )
+            #########
+
+            # the labels need to be a SparseTensor
+            index_targets, get_lengths = nn.sequences_tools(
+                sequenced_op_dict[key]
+            )
+            sequenced_encoder_targets = tf.SparseTensor(
+                tf.cast(index_targets, tf.int64),
+                tf.reshape(
+                    tf.gather_nd(sequenced_op_dict[key], index_targets), [-1]
+                ),
+                tf.cast(
+                    [tf.shape(get_lengths)[0], tf.reduce_max(get_lengths)],
+                    tf.int64
                 )
-                targets = tf.gather_nd(
-                    sequenced_op_dict[t_key], index_encoder_targets
-                )
-                np_key = swap(t_key, 'natural_params')
-                natural_params = tf.gather_nd(
-                    sequenced_op_dict[np_key], index_encoder_targets
-                )
+            )
 
-                # the form of the cross-entropy depends on the distribution
-                if data_manifest.distribution == 'Gaussian':
-                    # sum across features (axis=1)
-                    compute_cross_entropy = tf.reduce_sum(
-                        tf.square(natural_params - targets), 1)/2
-                elif data_manifest.distribution == 'categorical':
-                    compute_cross_entropy = tf.nn.sparse_softmax_cross_entropy_with_logits(
-                        labels=tf.reshape(targets, [-1]), logits=natural_params)
-                elif data_manifest.distribution == 'CTC':
-                    #########
-                    # Why do we need to pad the symbol dimensions with a zero??
-                    sequenced_natural_params = tf.pad(
-                        sequenced_op_dict[np_key],
-                        tf.constant([[0, 0], [0, 0], [0, 1]])
-                    )
-                    #########
+            ####
+            # ugh: not actually a cross entropy...
+            ####
+            compute_cross_entropy = tf.compat.v1.nn.ctc_loss(
+                sequenced_encoder_targets,
+                inputs=sequenced_natural_params,
+                sequence_length=get_lengths,
+                preprocess_collapse_repeated=True,
+                ctc_merge_repeated=False,
+                time_major=False
+            )
+        else:
+            # raise NotImplementedError(
+            #    "Only Gaussian, categorical cross entropies have been impl.")
+            print('WARNING: unrecognized data_manifest.', end='')
+            print('distribution; not computing a cross entropy')
+            return
 
-                    # the labels need to be a SparseTensor
-                    index_targets, get_lengths = nn.sequences_tools(
-                        sequenced_op_dict[t_key]
-                    )
-                    sequenced_encoder_targets = tf.SparseTensor(
-                        tf.cast(index_targets, tf.int64),
-                        tf.reshape(tf.gather_nd(
-                            sequenced_op_dict[t_key], index_targets
-                        ), [-1]),
-                        tf.cast(
-                            [tf.shape(get_lengths)[0], tf.reduce_max(get_lengths)],
-                            tf.int64
-                        )
-                    )
+        # average across elements of the batch
+        compute_cross_entropy = tf.reduce_mean(compute_cross_entropy, 0)
 
-                    ####
-                    # ugh: not actually a cross entropy...
-                    ####
-                    compute_cross_entropy = tf.compat.v1.nn.ctc_loss(
-                        sequenced_encoder_targets,
-                        inputs=sequenced_natural_params,
-                        sequence_length=get_lengths,
-                        preprocess_collapse_repeated=True,
-                        ctc_merge_repeated=False,
-                        time_major=False
-                    )
-                else:
-                    # raise NotImplementedError(
-                    #    "Only Gaussian, categorical cross entropies have been impl.")
-                    print('WARNING: unrecognized data_manifest.', end='')
-                    print('distribution; not computing a cross entropy')
-                    return
-
-                # average across elements of the batch
-                op_name = swap(t_key, 'cross_entropy')
-                compute_cross_entropy = tf.reduce_mean(
-                    input_tensor=compute_cross_entropy, axis=0,
-                    name='assess_' + op_name
+        # if TRAINING, add to losses
+        if TRAINING:
+            tf.compat.v1.add_to_collection(
+                tf.compat.v1.GraphKeys.LOSSES,
+                compute_cross_entropy*data_manifest.penalty_scale
+            )
+        else:
+            # assessment
+            ce_key = swap(key, 'cross_entropy')
+            if ce_key in self.assessment_op_set:
+                compute_cross_entropy = tf.identity(
+                    compute_cross_entropy, name='assess_' + ce_key
                 )
 
-                # if TRAINING, add to losses; otherwise create a TB summary
-                if TRAINING:
-                    tf.compat.v1.add_to_collection(
-                        tf.compat.v1.GraphKeys.LOSSES,
-                        compute_cross_entropy*data_manifest.penalty_scale
-                    )
-                else:  # assessment
-                    self.summary_op_set.add(op_name)
-                    tf.compat.v1.summary.scalar(
-                        'summarize_' + op_name,
-                        # write out in bits
-                        np.log2(np.e)*compute_cross_entropy
-                    )
+            # write cross_entropy to tb, whether or not it was requested
+            self.summary_op_set.add(ce_key)
+            tf.compat.v1.summary.scalar(
+                'summarize_' + ce_key, np.log2(np.e)*compute_cross_entropy
+            )
 
     def _assess(
         self, sess, assessment_struct, epoch, assessment_step,
         decoder_targets_list, data_partition
     ):
+        ########
+        # add functinality for preencoder categorical data?
+        ########
 
         # The summaries you wish to make for tensorboard.  You need a deep copy
         #  because you intend to alter the set on a temporary basis.
