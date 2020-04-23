@@ -301,10 +301,10 @@ class SequenceNetwork:
                 train_vars_scope, tower_name)
 
         @tfmpl.figure_tensor
-        def plotting_fxn(confusions):
+        def plotting_fxn(confusions, axis_labels):
             fig = toolbox.draw_confusion_matrix(
-                confusions,
-                (12, 12))
+                confusions, axis_labels, (12, 12)
+            )
             return fig
 
         def assessment_net_builder(GPU_op_dict, CPU_op_dict):
@@ -1609,7 +1609,10 @@ class SequenceNetwork:
         image_key = swap(key, 'confusions_image')
         if image_key in self.summary_op_set:
             tf.compat.v1.summary.image(
-                'summarize_%s' % image_key, plotting_fxn(confusions)
+                'summarize_%s' % image_key,
+                plotting_fxn(
+                    confusions, params.data_manifests[key].get_feature_list()
+                )
             )
 
         return confusions
@@ -1698,7 +1701,7 @@ class SequenceNetwork:
                 #  actual sequences match.  This is of course *not* enforced
                 #  when calculating the word error rate, which is done with the
                 #  'decoder_outputs', not 'decoder_natural_params'
-                index_encoder_targets, _ = nn.sequences_tools(
+                index_encoder_targets, get_lengths = nn.sequences_tools(
                     sequenced_op_dict[t_key]
                 )
                 targets = tf.gather_nd(
@@ -1725,15 +1728,29 @@ class SequenceNetwork:
                         tf.constant([[0, 0], [0, 0], [0, 1]])
                     )
                     #########
-                    _, get_lengths = nn.sequences_tools(sequenced_op_dict[np_key])
+
+                    # the labels need to be a SparseTensor
+                    index_targets, get_lengths = nn.sequences_tools(
+                        sequenced_op_dict[t_key]
+                    )
+                    sequenced_encoder_targets = tf.SparseTensor(
+                        tf.cast(index_targets, tf.int64),
+                        tf.reshape(tf.gather_nd(
+                            sequenced_op_dict[t_key], index_targets
+                        ), [-1]),
+                        tf.cast(
+                            [tf.shape(get_lengths)[0], tf.reduce_max(get_lengths)],
+                            tf.int64
+                        )
+                    )
 
                     ####
                     # ugh: not actually a cross entropy...
                     ####
                     compute_cross_entropy = tf.compat.v1.nn.ctc_loss(
-                        sequenced_op_dict[np_key],
-                        sequence_length=get_lengths,
+                        sequenced_encoder_targets,
                         inputs=sequenced_natural_params,
+                        sequence_length=get_lengths,
                         preprocess_collapse_repeated=True,
                         ctc_merge_repeated=False,
                         time_major=False
@@ -2089,9 +2106,9 @@ class SequenceNetwork:
             return data_op_tuple, misc_op_tuple, assessments
 
         @tfmpl.figure_tensor
-        def plotting_fxn(confusions):
+        def plotting_fxn(confusions, axis_labels):
             fig = toolbox.draw_confusion_matrix(
-                confusions, decoder_targets_list, (12, 12))
+                confusions, axis_labels, (12, 12))
             return fig
 
         def assessment_net_builder(GPU_op_dict, CPU_op_dict):
