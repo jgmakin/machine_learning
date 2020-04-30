@@ -232,10 +232,11 @@ def LSTM_rnn(
     '''
     # for brevity
     def variational_dropout_lstm_cell(input_size):
-        LSTMcell = tf.compat.v1.nn.rnn_cell.LSTMCell(input_size, name='basic_lstm_cell')
+        LSTMcell = tf.compat.v1.nn.rnn_cell.LSTMCell(
+            input_size, name='basic_lstm_cell'
+        )
         return tf.compat.v1.nn.rnn_cell.DropoutWrapper(
-            LSTMcell,
-            input_keep_prob=1-dropout,
+            LSTMcell, input_keep_prob=1-dropout,
         )
     with tf.compat.v1.variable_scope(name, reuse=tf.compat.v1.AUTO_REUSE):
         if BIDIRECTIONAL:
