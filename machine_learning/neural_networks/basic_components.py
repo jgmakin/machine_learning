@@ -104,8 +104,9 @@ def feed_forward_multi_layer(
 
 
 def feed_forward_one_layer(
-        input_tensor, layer_name, Nin=1, Nout=1,
-        preactivation_fxn=tf_matmul_wrapper, activation_fxn=tf.nn.relu):
+    input_tensor, layer_name, Nin=1, Nout=1,
+    preactivation_fxn=tf_matmul_wrapper, activation_fxn=tf.nn.relu
+):
     """NB that for convnets, Nout is number of *channels*"""
     with tf.compat.v1.variable_scope(layer_name, reuse=tf.compat.v1.AUTO_REUSE):
         preactivations = preactivation_fxn(input_tensor, Nin, Nout)
@@ -562,8 +563,10 @@ def tf_word_error_rates_built_in(
     #####
     # You should make this into a general function ("tf_broadcast_equal")...
     def extract_non_ignore_indices(sequences):
-        return tf.compat.v1.where(tf.reduce_all(input_tensor=tf.not_equal(tf.expand_dims(
-            sequences, 2), [[ignore_ids]]), axis=2))
+        return tf.compat.v1.where(tf.reduce_all(
+            tf.not_equal(tf.expand_dims(sequences, 2), [[ignore_ids]]),
+            axis=2
+        ))
     #####
 
     # ...
