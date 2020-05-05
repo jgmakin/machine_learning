@@ -38,32 +38,6 @@ Created: July 2017
   by JGM
 '''
 
-all_assessment_ops = [
-    '%s_%s' % (coder, op_name) for coder in ['encoder_1', 'decoder']
-    for op_name in [
-        'word_error_rate',
-        'accuracy',
-        'confusions',
-        'top_k_inds',
-        'xpct_normalized_accuracy',
-        'vrnc_normalized_accuracy',
-        #
-        'sequence_log_probs',
-        'targets',
-        'beam_targets',
-        'outputs',
-        'natural_params',
-    ]
-]
-
-
-# set up a structure for items to be assessed and returned
-class AssessmentTuple(toolbox.MutableNamedTuple):
-    __slots__ = ([
-        'writer', 'initializer', 'decoder_accuracies',
-        'decoder_word_error_rates'
-    ] + all_assessment_ops)
-
 
 @tfmpl.figure_tensor
 def dual_violin_plot(
@@ -153,7 +127,6 @@ class SequenceNetwork:
         BIAS_DECODER_OUTPUTS=False,  # to match seq2seq
         k_for_top_k_accuracy=5,
         assessment_op_set={
-            # see all_assessment_ops for all possibilities
             'decoder_word_error_rate',
             'decoder_accuracy',
             'decoder_confusions',
@@ -218,14 +191,14 @@ class SequenceNetwork:
             assert d_size == (1+self.ENCODER_RNN_IS_BIDIRECTIONAL)*e_size, \
                    "encoder/decoder layer-size mismatch!"
 
-        ############
-        # Do for *all* targets
-        ############
-        # Adjust the summary_op_set
-        if 'decoder_top_k_accuracy' in self.summary_op_set:
-            self.summary_op_set.remove('decoder_top_k_accuracy')
-            self.summary_op_set.add('decoder_top_%i_accuracy' % (k_for_top_k_accuracy))
-        ############
+        # adjust the summary_op_set so that tensorboard shows top_k nicely
+        for op_name in self.summary_op_set:
+            if op_name.endswith('top_k_accuracy'):
+                # if 'decoder_top_k_accuracy' in self.summary_op_set:
+                self.summary_op_set.remove(op_name)
+                self.summary_op_set.add(op_name.replace(
+                    'top_k_accuracy', 'top_%i_accuracy' % k_for_top_k_accuracy
+                ))
 
     def vprint(self, *args, **kwargs):
         if self.VERBOSE:
@@ -233,6 +206,14 @@ class SequenceNetwork:
 
     def _initialize_assessment_struct(
             self, initialize_data, data_type, num_epochs):
+
+        # set up a structure for items to be assessed and returned
+        class AssessmentTuple(toolbox.MutableNamedTuple):
+            __slots__ = ([
+                'writer', 'initializer', 'decoder_accuracies',
+                'decoder_word_error_rates'
+            ] + list(self.assessment_op_set))
+
         nums_assessments = math.ceil(num_epochs/self.assessment_epoch_interval)+1
         return AssessmentTuple(
             initializer=initialize_data,
@@ -240,7 +221,7 @@ class SequenceNetwork:
                 self.tf_summaries_dir, data_type)),
             decoder_accuracies=np.zeros((nums_assessments)),
             decoder_word_error_rates=np.zeros((nums_assessments)),
-            **dict.fromkeys(all_assessment_ops)
+            **dict.fromkeys(self.assessment_op_set)
         )
 
     def fit(
@@ -586,7 +567,7 @@ class SequenceNetwork:
                         # Since this graph will be used only for inference
                         #  there's no point in saving the parts associated
                         #  with encoder_targets, which are *auxiliary*.
-                        'encoder_targets': tf.cast([[[]]], tf.float32),
+                        'encoder_1_targets': tf.cast([[[]]], tf.float32),
                     },
                     {
                         'subnet_id': tf.constant(subnets_params[0].subnet_id)
@@ -1108,10 +1089,7 @@ class SequenceNetwork:
                     desequenced_natural_params = self._output_net(
                         desequence_RNN_outputs,
                         layer_size*(1+self.ENCODER_RNN_IS_BIDIRECTIONAL),
-                        #########
-                        # Fix this to allow for different projection sizes
-                        self.layer_sizes['encoder_projection'],
-                        #########
+                        self.layer_sizes[subnet_name],
                         params.data_manifests[t_key].num_features,
                         FF_dropout, subnet_name=subnet_name
                     )
