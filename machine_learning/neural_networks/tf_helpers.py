@@ -469,8 +469,8 @@ def rescale(get_X, xmin, xmax, zmin, zmax):
     return scaling*(get_X - xmin) + zmin
 
 
-def tf_print(tensor, message="JGM TENSOR: "):
-    print_op = tf.print(message, tensor)
+def tf_print(tensor, message="JGM TENSOR: ", **kwargs):
+    print_op = tf.print(message, tensor, **kwargs)
     with tf.control_dependencies([print_op]):
         tensor = tf.identity(tensor)
     return tensor

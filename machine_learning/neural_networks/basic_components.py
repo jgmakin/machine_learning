@@ -57,7 +57,9 @@ def tf_conv2d_wrapper(
         strides=[1, 1, 1, 1], num_shards=None, USE_BIASES=True):
     wts_shape = [filter_height, filter_width, Nin, Nout]
     wts = create_weights(wts_shape, stiffness=stiffness, num_shards=num_shards)
-    preactivations = tf.nn.conv2d(input=inputs, filters=wts, strides=strides, padding='VALID')
+    preactivations = tf.nn.conv2d(
+        input=inputs, filters=wts, strides=strides, padding='VALID'
+    )
     ### provide the name to conv2d??  otherwise eliminate....
     return preactivations
 
@@ -356,8 +358,8 @@ def sequences_tools(sequences):
     #  simultaneously zero only in the zero-padding, the 1s will be
     #  contiguous, and the number of them in each row will be the
     #  corresponding true sequence length
-    mask_binariwise = tf.sign(tf.reduce_max(input_tensor=tf.abs(sequences), axis=2))
-    get_sequences_lengths = tf.reduce_sum(input_tensor=mask_binariwise, axis=1)
+    mask_binariwise = tf.sign(tf.reduce_max(tf.abs(sequences), axis=2))
+    get_sequences_lengths = tf.reduce_sum(mask_binariwise, axis=1)
     get_sequences_lengths = tf.cast(get_sequences_lengths, tf.int32)
     # shouldn't it already be an int?
     index_sequences_elements = tf.cast(
@@ -587,7 +589,7 @@ def tf_word_error_rates_built_in(
 
 def seq_log_probs_to_word_log_probs(
     get_beam_outputs, get_sequence_log_probs, Nclasses,
-    index_sequences_elements, max_targ_length, padding_value=0
+    index_sequences_elements, max_hyp_length, padding_value=0
 ):
     '''
     :param get_outputs: (Nsequences x beam_width x max_prediction_length)
@@ -595,7 +597,7 @@ def seq_log_probs_to_word_log_probs(
     :param Nclasses: scalar
     :param index_sequence_elements: (sum_i^Nsequences seq_len(i) x 2), a list
         of all the (putative) non-zero indices in the tensor of sequences
-    :param max_targ_length: scalar tensor
+    :param max_hyp_length: scalar tensor
     :return: score_as_unnorm_log_probs: (sum_i^Nsequences seq_len(i) x Nclasses),
         a tensor of log probabilities for each id, de-sequenced
 
@@ -653,15 +655,15 @@ def seq_log_probs_to_word_log_probs(
         tf.expand_dims(tf.expand_dims(get_sequence_log_probs, axis=-1), axis=-1)
     )
 
-    # pad out to max_targ_length
-    #   -> (Ncases x beam_width x max_targ_length x Nclasses)
+    # pad out to max_hyp_length
+    #   -> (Ncases x beam_width x max_hyp_length x Nclasses)
     max_pred_length = common_layers.shape_list(get_beam_outputs)[2]
     in_beam_log_probs = tf.pad(
         tensor=in_beam_log_probs,
         paddings=[
             [0, 0],
             [0, 0],
-            [0, tf.maximum(max_targ_length - max_pred_length, 0) + 1],
+            [0, tf.maximum(max_hyp_length - max_pred_length, 0) + 1],
             [0, 0]
         ],
         constant_values=padding_value
@@ -673,7 +675,7 @@ def seq_log_probs_to_word_log_probs(
 
     # fill in zeros with (approximate) out-of-beam log probs (see above)
     out_beam_log_prob = tf.multiply(
-        tf.cast(-max_targ_length, tf.float32),
+        tf.cast(-max_hyp_length, tf.float32),
         tf.math.log(tf.cast(Nclasses, tf.float32))
     )
     out_beam_log_probs = tf.fill(
@@ -684,7 +686,7 @@ def seq_log_probs_to_word_log_probs(
         IS_OUT_OF_BEAM, out_beam_log_probs, in_beam_log_probs
     )
 
-    # collapse across beam -> (Ncases x max_targ_length x Nclasses)
+    # collapse across beam -> (Ncases x max_hyp_length x Nclasses)
     score_as_unnorm_log_probs = tf.reduce_logsumexp(beam_log_probs, axis=1)
 
     # de-sequence -> (sum_i^Ncases targ_seq_len(i) x Nclasses)

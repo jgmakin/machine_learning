@@ -112,6 +112,7 @@ class SequenceNetwork:
         Ncases=256,
         stiffness=0,
         beam_alpha=0.6,
+        max_hyp_length=20,
         EOS_token='<EOS>',
         pad_token='<pad>',
         OOV_token='<OOV>',
@@ -121,7 +122,6 @@ class SequenceNetwork:
         checkpoint_path='~/tmp/checkpoint_data/model.ckpt',
         TARGETS_ARE_SEQUENCES=True,
         ASSESS_ALL_DECIMATIONS=True,
-        PREENCODER_RNN_IS_BIDIRECTIONAL=True,
         ENCODER_RNN_IS_BIDIRECTIONAL=True,
         MAX_POOL=False,
         BIAS_DECODER_OUTPUTS=False,  # to match seq2seq
@@ -387,7 +387,8 @@ class SequenceNetwork:
         def get_per_class_saliency_norms(sess, initializer, get_input_saliencies):
             # take norm across time
             get_per_example_norms = tf.sqrt(tf.reduce_sum(
-                input_tensor=tf.square(get_input_saliencies), axis=1))
+                tf.square(get_input_saliencies), axis=1)
+            )
 
             # ...
             all_per_example_norms = np.zeros(
@@ -515,7 +516,7 @@ class SequenceNetwork:
         ##########
     def save_prediction_graph(
         self, subnets_params, restore_epoch, save_dir, num_sequences=1,
-        max_hyp_length=20, inputs_dtype=tf.float32
+        inputs_dtype=tf.float32
     ):
         '''
         Save the graph so that it can later be loaded and used for inference.
@@ -523,7 +524,6 @@ class SequenceNetwork:
         :param subnets_params:
         :param restore_epoch:
         :param N
-        :param max_hyp_length:
         :param inputs_dtype:
         :return: predict, a function that takes input sequences (numpy arrays)
             as input, and returns the target predictions as unnormalized log
@@ -551,11 +551,11 @@ class SequenceNetwork:
             def indexing_fxn(targets):
                 row_inds, col_inds = tf.meshgrid(
                     tf.range(num_sequences),
-                    tf.range(max_hyp_length), indexing='ij')
+                    tf.range(self.max_hyp_length), indexing='ij')
                 index_sequences_elements = tf.stack((
                     tf.reshape(row_inds, [-1]), tf.reshape(col_inds, [-1])), 1)
 
-                return index_sequences_elements, max_hyp_length
+                return index_sequences_elements, self.max_hyp_length
 
             # build assessment graph
             get_sequenced_outputs, get_sequenced_natural_params = \
@@ -655,14 +655,13 @@ class SequenceNetwork:
             decode_assessments_core = self._decode_assessment_tokens
 
         # index the target sequences
-        index_decoder_targets, max_targ_length = indexer(
-            sequenced_op_dict['decoder_targets'])
+        index_decoder_targets, _ = indexer(sequenced_op_dict['decoder_targets'])
 
         def loop_body(
             initial_ind_op,
+            sequenced_natural_params_dict,
             concatenate_sequenced_decoder_outputs,
             concatenate_decoder_sequence_log_probs,
-            sequenced_natural_params_dict,
         ):
             nonlocal sequenced_op_dict
 
@@ -687,8 +686,8 @@ class SequenceNetwork:
                  concatenate_sequenced_decoder_outputs,
                  concatenate_decoder_sequence_log_probs
                  ) = decode_assessments_core(
-                    params, final_encoder_states, max_targ_length,
-                    sequenced_op_dict, sequenced_natural_params_dict,
+                    params, final_encoder_states, sequenced_op_dict,
+                    sequenced_natural_params_dict,
                     concatenate_sequenced_decoder_outputs,
                     concatenate_decoder_sequence_log_probs
                 )
@@ -703,24 +702,24 @@ class SequenceNetwork:
 
                 return (
                     initial_ind_op+1,
+                    sequenced_natural_params_dict,
                     concatenate_sequenced_decoder_outputs,
                     concatenate_decoder_sequence_log_probs,
-                    sequenced_natural_params_dict,
                 )
 
         # initial values of loop vars
         count_num_cases = tf.shape(sequenced_op_dict['decoder_targets'])[0]
         initial_values = [
             tf.constant(initial_initial_ind),
-            tf.fill((count_num_cases, 0, max_targ_length), 0),
-            tf.fill((count_num_cases, 0), 0.0),
             {
                 swap(key, 'natural_params'): tf.fill([
                     tf.shape(op)[0], tf.shape(op)[1],
                     params.data_manifests[key].num_features
                 ], 0.0)
                 for key, op in sequenced_op_dict.items() if '_targets' in key
-            }
+            },
+            tf.fill((count_num_cases, 0, self.max_hyp_length), 0),
+            tf.fill((count_num_cases, 0), 0.0),
         ]
         ######
         # count_num_cases is not altogether invariant, but it is invariant
@@ -728,21 +727,21 @@ class SequenceNetwork:
         #  able to communicate this.
         shape_invariants = [
             tf.TensorShape([]),
-            tf.TensorShape([None, None, None]),
-            tf.TensorShape([None, None]),
             {
                 swap(key, 'natural_params'): tf.TensorShape([
                     None, None, params.data_manifests[key].num_features
                 ])
                 for key in sequenced_op_dict if '_targets' in key
             },
+            tf.TensorShape([None, None, None]),
+            tf.TensorShape([None, None]),
         ]
         ######
 
         # run the loop
-        (_, sequenced_op_dict['decoder_outputs'],
+        (_, sequenced_natural_params_dict,
+         sequenced_op_dict['decoder_outputs'],
          sequenced_op_dict['decoder_sequence_log_probs'],
-         sequenced_natural_params_dict
          ) = tf.while_loop(
             cond=lambda initial_ind, aa, bb, cc:
                 initial_ind < (initial_initial_ind+num_loops),
@@ -756,7 +755,7 @@ class SequenceNetwork:
         # and now update the sequenced_op_dict
         sequenced_op_dict = update_decoder_assessments(
             'decoder_targets', sequenced_op_dict, params,
-            index_decoder_targets, max_targ_length, num_loops
+            index_decoder_targets, num_loops
         )
 
         # If any encoder targets are categorically distributed, collect the
@@ -779,7 +778,7 @@ class SequenceNetwork:
         return sequenced_op_dict
 
     def _decode_assessment_tokens(
-        self, params, final_encoder_states, max_targ_length, sequenced_op_dict,
+        self, params, final_encoder_states, sequenced_op_dict,
         sequenced_natural_params_dict, concatenate_sequenced_decoder_outputs,
         concatenate_decoder_sequence_log_probs
     ):
@@ -797,7 +796,7 @@ class SequenceNetwork:
         )
 
     def _decode_assessment_sequences(
-        self, params, final_encoder_states, max_targ_length, sequenced_op_dict,
+        self, params, final_encoder_states, sequenced_op_dict,
         sequenced_natural_params_dict, concatenate_sequenced_decoder_outputs,
         concatenate_decoder_sequence_log_probs
     ):
@@ -805,12 +804,11 @@ class SequenceNetwork:
          ) = self._decode_assessment_sequences_core(
             final_encoder_states, sequenced_op_dict['decoder_targets'], params,
             params.data_manifests['decoder_targets'].get_feature_list(),
-            max_targ_length
         )
 
         # as though the beam were (beam_width*temporal stride) wide
         targ_length = tf.shape(get_sequenced_decoder_outputs)[2]
-        paddings = [[0, 0], [0, 0], [0, max_targ_length-targ_length]]
+        paddings = [[0, 0], [0, 0], [0, self.max_hyp_length-targ_length]]
         get_sequenced_decoder_outputs = tf.pad(
             tensor=get_sequenced_decoder_outputs, paddings=paddings,
             constant_values=params.data_manifests[
@@ -831,7 +829,7 @@ class SequenceNetwork:
 
     def _decode_assessment_sequences_core(
         self, final_encoder_states, get_targets, subnet_params,
-        decoder_targets_list, max_hyp_length,
+        decoder_targets_list,
     ):
 
         eos_id = decoder_targets_list.index(self.EOS_token)
@@ -885,7 +883,7 @@ class SequenceNetwork:
         (get_sequenced_decoder_outputs, get_decoder_sequence_log_probs, _
          ) = beam_search.beam_search(
             prev_symbols_to_natural_params, initial_ids, self.beam_width,
-            max_hyp_length, num_decoder_target_features, self.beam_alpha,
+            self.max_hyp_length, num_decoder_target_features, self.beam_alpha,
             states={"decoder state": final_encoder_states}, eos_id=eos_id
         )
 
@@ -900,8 +898,7 @@ class SequenceNetwork:
         return get_sequenced_decoder_outputs, get_decoder_sequence_log_probs
 
     def _update_token_assessments(
-        self, key, sequenced_op_dict, params, index_targets, max_targ_length,
-        num_loops
+        self, key, sequenced_op_dict, params, index_targets, num_loops
     ):
         sequenced_op_dict[swap(key, 'natural_params')] /= num_loops
 
@@ -919,15 +916,14 @@ class SequenceNetwork:
         return sequenced_op_dict
 
     def _update_sequence_assessments(
-        self, key, sequenced_op_dict, params, index_targets, max_targ_length,
-        num_loops
+        self, key, sequenced_op_dict, params, index_targets, num_loops
     ):
         # convert: beam, sequence log probs -> token, all-word log probs
         desequenced_natural_params = nn.seq_log_probs_to_word_log_probs(
             sequenced_op_dict[swap(key, 'outputs')],
             sequenced_op_dict[swap(key, 'sequence_log_probs')],
             params.data_manifests[key].num_features,
-            index_targets, max_targ_length,
+            index_targets, self.max_hyp_length,
             params.data_manifests[key].padding_value,
         )
 
@@ -1224,10 +1220,7 @@ class SequenceNetwork:
         get_targets = sequenced_op_dict['decoder_targets']
         index_sequences_elements, get_sequences_lengths = nn.sequences_tools(
             get_targets)
-        ######
-        # can you do this with tf.shape?
         Nsequences = common_layers.shape_list(final_encoder_states[-1].h)[0]
-        ######
         initial_ids = tf.fill([Nsequences, 1, 1], eos_id)
 
         # embed input sequences; pass thru RNN; de-sequence outputs
@@ -1523,8 +1516,7 @@ class SequenceNetwork:
             EXCLUDE_EOS=True, eos_id=eos_id
         )
         assess_word_error_rate = tf.reduce_mean(
-            input_tensor=get_word_error_rates,
-            name='assess_%s' % swap(key, 'word_error_rate')
+            get_word_error_rates, name='assess_%s' % swap(key, 'word_error_rate')
         )
         ######
         # FIX ME
@@ -1554,7 +1546,8 @@ class SequenceNetwork:
                 desequenced_targets, qvec_samples,
                 tf.constant([num_target_features]*2, dtype=tf.int32))
             xpct_pvec_unnorm = tf.reduce_sum(
-                input_tensor=xpct_pvec_qvec_unnorm, axis=1, keepdims=True)
+                xpct_pvec_qvec_unnorm, axis=1, keepdims=True
+            )
             confusions = tf.divide(
                 xpct_pvec_qvec_unnorm, xpct_pvec_unnorm,
                 name='assess_%s' % swap(key, 'confusions')
@@ -1584,7 +1577,7 @@ class SequenceNetwork:
 
         # EXPECTED frequency-normalized accuracy
         xpct_key = swap(key, 'xpct_normalized_accuracy')
-        target_frequencies = tf.reduce_sum(input_tensor=confusions, axis=1)
+        target_frequencies = tf.reduce_sum(confusions, axis=1)
         where_targets = tf.cast(
             tf.compat.v1.where(target_frequencies > 0), tf.int32
         )
@@ -1592,8 +1585,8 @@ class SequenceNetwork:
             tf.gather(tf.linalg.diag_part(confusions), where_targets),
             tf.gather(target_frequencies, where_targets))
         assess_xpct_frequency_normalized_accuracy = tf.reduce_mean(
-            input_tensor=frequency_normalized_accuracies,
-            name='assess_%s' % xpct_key)
+            frequency_normalized_accuracies, name='assess_%s' % xpct_key
+        )
         if xpct_key in self.summary_op_set:
             tf.compat.v1.summary.scalar(
                 'summarize_%s' % xpct_key,
@@ -1603,7 +1596,7 @@ class SequenceNetwork:
         # VARIANCE of the frequency-normalized accuracy
         vrnc_key = swap(key, 'vrnc_normalized_accuracy')
         assess_vrnc_frequency_normalized_accuracy = tf.reduce_mean(
-            input_tensor=tf.math.squared_difference(
+            tf.math.squared_difference(
                 frequency_normalized_accuracies,
                 assess_xpct_frequency_normalized_accuracy
             ),
@@ -1728,8 +1721,7 @@ class SequenceNetwork:
                     assessment_struct.decoder_beam_targets, decoder_targets_list
                 )[0]
                 cprint(
-                    'example ' + data_partition + ' reference:',
-                    on_color=on_clr
+                    'example %s reference:' % data_partition, on_color=on_clr
                 )
                 cprint('\t' + sequenced_decoder_target, on_color='on_red')
 
@@ -1835,7 +1827,7 @@ class SequenceNetwork:
     def _standard_indexer(sequences):
         (index_sequences_elements, get_sequences_lengths) = nn.sequences_tools(
             sequences)
-        max_length = tf.reduce_max(input_tensor=get_sequences_lengths)
+        max_length = tf.reduce_max(get_sequences_lengths)
         # "you should use something longer than max_sequences_lengths!"
         return index_sequences_elements, max_length
 
@@ -2079,7 +2071,7 @@ class SequenceNetwork:
         index_unguessable_unnorm_log_probs = tf.cast(
             tf.compat.v1.where(tf.equal(get_guessable_unnorm_log_probs, 0)), tf.int32)
         ###
-        get_batch_min = tf.reduce_min(input_tensor=score_as_unnorm_log_probs)
+        get_batch_min = tf.reduce_min(score_as_unnorm_log_probs)
         # This feels ugly--would be better, albeit more complicated, to use the
         #  row mins. On the other hand, you still have to do the weird thing of
         #  multiplying it by two or whatever....
@@ -2133,7 +2125,7 @@ class TargetFilter:
         TEST_SPECIAL = tf.constant(False)
         for target_indices in self.target_specs[data_type]:
             TEST_MATCH = tf.reduce_all(
-                input_tensor=tf.linalg.diag_part(tf.equal(
+                tf.linalg.diag_part(tf.equal(
                     fetch_target_indices,
                     np.array(target_indices, ndmin=2))
                 ))
@@ -2156,21 +2148,37 @@ class TargetFilter:
 
 
 def cross_entropy(key, data_manifest, sequenced_op_dict):
+    '''
+    ...
+
+    In fact, this function *averages*, rather than sums, across all features
+    given by a particular key.  Although the result is not technically the
+    cross entropy of the output, it is more easily comparable across keys and
+    therefore facilitates the design of penalty_scales.
+    '''
 
     # desequence the targets and natural_params
     # NB that this enforces that the lengths of the predicted and actual
     #  sequences match.  This is of course *not* enforced when calculating the
-    #  word error rate, which is done with the 'decoder_outputs', not
+    #  word error rate, which is anyway computed from 'decoder_outputs', not
     #  'decoder_natural_params'.
     index_targets, get_lengths = nn.sequences_tools(sequenced_op_dict[key])
     targets = tf.gather_nd(sequenced_op_dict[key], index_targets)
     np_key = swap(key, 'natural_params')
     natural_params = tf.gather_nd(sequenced_op_dict[np_key], index_targets)
 
+    ########
+    # PRINT STATEMENTS FOR DEBUGGING
+    # _, get_np_lengths = nn.sequences_tools(sequenced_op_dict[np_key])
+    # tfh.tf_print([], '')
+    # tfh.tf_print(get_lengths[:5], '%s TARGET LENGTHS:' % key)
+    # tfh.tf_print(get_np_lengths[:5], '%s NP LENGTHS:' % key)
+    ########
+
     # the form of the cross-entropy depends on the distribution
     if data_manifest.distribution == 'Gaussian':
-        # sum across features (axis=1)
-        compute_cross_entropy = tf.reduce_sum(
+        # average across features (axis=1)
+        compute_cross_entropy = tf.reduce_mean(
             tf.square(natural_params - targets), 1)/2
     elif data_manifest.distribution == 'categorical':
         compute_cross_entropy = tf.nn.sparse_softmax_cross_entropy_with_logits(
