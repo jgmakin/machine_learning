@@ -1860,7 +1860,7 @@ class SequenceNetwork:
                 lambda example_proto: tfh.parse_protobuf_seq2seq_example(
                     example_proto, subnet_params.data_manifests
                 ),
-                num_parallel_calls=32
+                num_parallel_calls=tf.data.experimental.AUTOTUNE
             )
             #########
             # Insane tensorflow bug: "num_parallel_calls" cannot be moved to
@@ -1911,7 +1911,7 @@ class SequenceNetwork:
                 }
             )
 
-            dataset = dataset.prefetch(num_cases)
+            dataset = dataset.prefetch(tf.data.experimental.AUTOTUNE) #num_cases)
             ######
             # Since your parse_protobuf_seq2seq_example isn't doing much, the
             #  overhead associated with just scheduling the dataset.map will
@@ -2219,6 +2219,15 @@ def cross_entropy(key, data_manifest, sequenced_op_dict):
         print('WARNING: unrecognized data_manifest.', end='')
         print('distribution; not computing a cross entropy')
         return
+
+    ######################
+    # print_op = tf.print('SHAPE', tf.shape(natural_params))
+    # with tf.control_dependencies([print_op]):
+    #     compute_cross_entropy = tf.identity(compute_cross_entropy)
+    # compute_cross_entropy = tfh.tf_print(
+    #     compute_cross_entropy, '%s CROSS ENTROPY:' % data_manifest.distribution
+    # )
+    ######################
 
     # average across elements of the batch
     return tf.reduce_mean(compute_cross_entropy, 0)

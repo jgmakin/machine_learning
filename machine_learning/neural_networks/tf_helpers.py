@@ -533,13 +533,7 @@ def parse_protobuf_seq2seq_example(example_proto, data_manifests):
         )
         example_dict[key] = data_manifest.transform(sequence_matrix)
 
-    ############
     return example_dict
-    # keys_tensor = tf.constant(example_dict.keys())
-    # vals_tensor = tf.constant(example_dict.values())
-    # return tf.lookup.StaticHashTable(
-    #     tf.lookup.KeyValueTensorInitializer(keys_tensor, vals_tensor), -1)
-    ############
 
 
 def replace_with_gaussian_noise(data_op):
