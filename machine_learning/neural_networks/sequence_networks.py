@@ -1910,15 +1910,6 @@ class SequenceNetwork:
                         subnet_params.subnet_id, dtype=tf.int32)
                 }
             )
-
-            dataset = dataset.prefetch(tf.data.experimental.AUTOTUNE) #num_cases)
-            ######
-            # Since your parse_protobuf_seq2seq_example isn't doing much, the
-            #  overhead associated with just scheduling the dataset.map will
-            #  dominate the cost of applying it.  Therefore, tensorflow
-            #  recommends batching first, and applying a vectorized version of
-            #  parse_protobuf_seq2seq_example.  But you shuffle first.....
-            ######
             dataset_list.append(dataset)
 
         # (randomly) interleave (sub-)batches w/o throwing anything away
@@ -1926,6 +1917,14 @@ class SequenceNetwork:
             lambda set_a, set_b: set_a.concatenate(set_b), dataset_list
         )
         dataset = dataset.shuffle(buffer_size=3000)
+        ######
+        # Since your parse_protobuf_seq2seq_example isn't doing much, the
+        #  overhead associated with just scheduling the dataset.map will
+        #  dominate the cost of applying it.  Therefore, tensorflow
+        #  recommends batching first, and applying a vectorized version of
+        #  parse_protobuf_seq2seq_example.  But you shuffle first.....
+        ######
+        dataset = dataset.prefetch(tf.data.experimental.AUTOTUNE) #num_cases)
 
         return dataset
 
@@ -2167,14 +2166,6 @@ def cross_entropy(key, data_manifest, sequenced_op_dict):
     np_key = swap(key, 'natural_params')
     natural_params = tf.gather_nd(sequenced_op_dict[np_key], index_targets)
 
-    ########
-    # PRINT STATEMENTS FOR DEBUGGING
-    # _, get_np_lengths = nn.sequences_tools(sequenced_op_dict[np_key])
-    # tfh.tf_print([], '')
-    # tfh.tf_print(get_lengths[:5], '%s TARGET LENGTHS:' % key)
-    # tfh.tf_print(get_np_lengths[:5], '%s NP LENGTHS:' % key)
-    ########
-
     # the form of the cross-entropy depends on the distribution
     if data_manifest.distribution == 'Gaussian':
         # average across features (axis=1)
@@ -2220,17 +2211,9 @@ def cross_entropy(key, data_manifest, sequenced_op_dict):
         print('distribution; not computing a cross entropy')
         return
 
-    ######################
-    # print_op = tf.print('SHAPE', tf.shape(natural_params))
-    # with tf.control_dependencies([print_op]):
-    #     compute_cross_entropy = tf.identity(compute_cross_entropy)
-    # compute_cross_entropy = tfh.tf_print(
-    #     compute_cross_entropy, '%s CROSS ENTROPY:' % data_manifest.distribution
-    # )
-    ######################
-
     # average across elements of the batch
     return tf.reduce_mean(compute_cross_entropy, 0)
+    ###return tf.reduce_sum(compute_cross_entropy, 0)
 
 
 def swap(key, string):
