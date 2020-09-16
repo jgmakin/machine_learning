@@ -24,8 +24,14 @@ setuptools.setup(
     install_requires=[
         'numpy',
         'scipy',
-        'tensor2tensor==1.15.5',
-        'tensorflow-probability>=0.7',
+        #####
+        # these ought to be enforced by tensor2tensor, but they're not
+        'kfac==0.2.0',
+        'dopamine_rl==2.0.5',
+        'gym==0.12.4',
+        #####
+        'tensorflow-probability==0.7',
+        'tensor2tensor==1.15.7',
         'tfmpl',
         'protobuf>=3.7',
         # 'tensorflow-gpu==1.15.3'  the cpu version will also work
