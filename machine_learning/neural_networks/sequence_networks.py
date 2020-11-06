@@ -16,6 +16,7 @@ import tensorflow_probability as tfp
 from tensorflow.python import pywrap_tensorflow
 from tensor2tensor.layers import common_layers
 from tensor2tensor.utils import beam_search as beam_search
+
 import tfmpl
 
 # local
