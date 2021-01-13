@@ -29,6 +29,7 @@ setuptools.setup(
         'kfac==0.2.0',
         'dopamine_rl==2.0.5',
         'gym==0.12.4',
+        'absl-py==0.10.0',
         #####
         'tensorflow-probability==0.7',
         'tensor2tensor==1.15.7',

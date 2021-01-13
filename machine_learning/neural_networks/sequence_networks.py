@@ -1159,7 +1159,7 @@ class SequenceNetwork:
         # for each sequence type...
         for key, sequenced_op in sequenced_op_dict.items():
             # if it's an encoder_target...
-            if key.endswith('targets') and key.startswith('encoder'):
+            if key.startswith('encoder') and key.endswith('targets'):
 
                 # reverse (to match reversal of inputs) and decimate
                 _, get_targets_lengths = nn.sequences_tools(sequenced_op)
