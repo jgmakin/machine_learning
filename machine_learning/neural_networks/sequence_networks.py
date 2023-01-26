@@ -16,8 +16,12 @@ import tensorflow_probability as tfp
 from tensorflow.python import pywrap_tensorflow
 from tensor2tensor.layers import common_layers
 from tensor2tensor.utils import beam_search as beam_search
+try:
+    import tfmpl
+except ModuleNotFoundError:
+    print('Package conflict (probably because you are using TF2.x)', end='')
+    print('...not loading tfmpl...')
 
-import tfmpl
 
 # local
 from utils_jgm import toolbox
@@ -253,7 +257,7 @@ class SequenceNetwork:
                 self.compute_learning_rate(subnets_params, 813))
             # I think the issue here is AdaM: it prefers to start with learning
             #  rates near 3e-4, independent of the total number of training
-            #  data.  So just hard-code Ntota = 813 to yield 3e-4 with temp=0.4
+            #  data. So just hard-code Ntotal = 813 to yield 3e-4 with temp=0.4
 
             '''
             optimizer = tf.contrib.opt.AdamWOptimizer(
