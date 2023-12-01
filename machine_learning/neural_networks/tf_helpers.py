@@ -7,7 +7,10 @@ import os
 import numpy as np
 import tensorflow as tf
 from tensorflow.python.client import device_lib
-from tensor2tensor.layers import common_layers
+try:
+    from tensor2tensor.layers import common_layers
+except ModuleNotFoundError:
+    print('WARNING: tensor2tensor not found; skipping')
 
 # local
 from utils_jgm.toolbox import auto_attribute
@@ -459,8 +462,10 @@ def fancy_indexing(X, extract_inds, axis=0):
     matricize_grid = tf.stack(vectorize_grid, axis=1)
 
     # gather them up and reshape
-    new_shape = [X_shape[i] if i != axis else tf.shape(input=extract_inds)[0]
-                 for i in range(len(common_layers.shape_list(X)))]
+    new_shape = [
+        X_shape[i] if i != axis else tf.shape(input=extract_inds)[0]
+        for i in range(len(common_layers.shape_list(X)))
+    ]
     return tf.reshape(tf.gather_nd(X, matricize_grid), new_shape)
 
 

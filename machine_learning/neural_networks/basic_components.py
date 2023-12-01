@@ -3,7 +3,10 @@ import pdb
 
 # third-party packages
 import tensorflow as tf
-from tensor2tensor.layers import common_layers
+try:
+    from tensor2tensor.layers import common_layers
+except ModuleNotFoundError:
+    print('WARNING: tensor2tensor missing; skipping')
 
 # local
 from . import tf_helpers as tfh
@@ -242,11 +245,11 @@ def LSTM_rnn(
             LSTMcell, input_keep_prob=1-dropout,
         )
     with tf.compat.v1.variable_scope(name, reuse=tf.compat.v1.AUTO_REUSE):
-        if BIDIRECTIONAL:
-            forward_layers = [
-                variational_dropout_lstm_cell(layer_size)
-                for layer_size in hidden_layer_sizes
-            ]
+        forward_layers = [
+            variational_dropout_lstm_cell(layer_size)
+            for layer_size in hidden_layer_sizes
+        ]
+        if BIDIRECTIONAL:       
             backward_layers = [
                 variational_dropout_lstm_cell(layer_size)
                 for layer_size in hidden_layer_sizes
@@ -309,10 +312,6 @@ def LSTM_rnn(
             # states_tuple = tuple(all_states)
 
         else:
-            forward_layers = [
-                variational_dropout_lstm_cell(layer_size)
-                for layer_size in hidden_layer_sizes
-            ]
             outputs, states_tuple = tf.compat.v1.nn.dynamic_rnn(
                 tf.compat.v1.nn.rnn_cell.MultiRNNCell(forward_layers),
                 batch_sequences,
@@ -323,8 +322,9 @@ def LSTM_rnn(
 
 
 def variable_summaries(var, name):
-    """Attach a lot of summaries to a Tensor (for TensorBoard
-    visualization)."""
+    '''
+    Attach a lot of summaries to a Tensor (for TensorBoard visualization).
+    '''
     with tf.compat.v1.name_scope('summaries'):
         mean = tf.reduce_mean(input_tensor=var, name=name)
         tf.compat.v1.summary.scalar('mean', mean)
@@ -434,8 +434,9 @@ def tf_expected_word_error_rates(
     hypotheses = tf.reshape(hypotheses, [N_sentences, -1])
 
     # get word error rates
-    get_word_error_rate = (tf_word_error_rates_built_in if USE_BUILTIN
-                           else tf_word_error_rates)
+    get_word_error_rate = (
+        tf_word_error_rates_built_in if USE_BUILTIN else tf_word_error_rates
+    )
     word_error_rate_matrix = tf.reshape(
         get_word_error_rate(references, hypotheses, EXCLUDE_EOS, eos_id),
         [-1, beam_width]
@@ -485,8 +486,9 @@ def tf_word_error_rates(references, hypotheses, EXCLUDE_EOS=False, eos_id=1):
     max_hyp_length = common_layers.shape_list(hypotheses)[1]
 
     # upper bound on WER
-    d_maxes = tf.fill((N_sentences,),
-                      tf.maximum(max_ref_length, max_hyp_length) + 1)
+    d_maxes = tf.fill(
+        (N_sentences,), tf.maximum(max_ref_length, max_hyp_length) + 1
+    )
 
     # get all the sequence lengths
     _, get_ref_lengths = sequences_tools(tf.expand_dims(references, axis=2))
@@ -876,3 +878,80 @@ def tf_linear_interpolation(X, stretch_factor, axis=0):
     get_w_upper = tf.reshape(get_w_upper, new_shape)
 
     return get_w_lower*extract_lower_vals + get_w_upper*extract_upper_vals
+
+
+def swap(key, string):
+    # In SequenceNetworks, keys are often constructed from the data_manifest
+    #  key by swapping out the word 'targets' for some other string.  This is
+    #  just a shortcut for that process.
+    return key.replace('targets', string)
+
+
+def cross_entropy(key, data_manifest, sequenced_op_dict):
+    '''
+    ...
+
+    In fact, this function *averages*, rather than sums, across all features
+    given by a particular key.  Although the result is not technically the
+    cross entropy of the output, it is more easily comparable across keys and
+    therefore facilitates the design of penalty_scales.
+    '''
+
+    # desequence the targets and natural_params
+    # NB that this enforces that the lengths of the predicted and actual
+    #  sequences match.  This is of course *not* enforced when calculating the
+    #  word error rate, which is anyway computed from 'decoder_outputs', not
+    #  'decoder_natural_params'.
+    index_targets, get_lengths = sequences_tools(sequenced_op_dict[key])
+    targets = tf.gather_nd(sequenced_op_dict[key], index_targets)
+    np_key = swap(key, 'natural_params')
+    natural_params = tf.gather_nd(sequenced_op_dict[np_key], index_targets)
+
+    # the form of the cross-entropy depends on the distribution
+    if data_manifest.distribution == 'Gaussian':
+        # average across features (axis=1)
+        compute_cross_entropy = tf.reduce_mean(
+            tf.square(natural_params - targets), 1)/2
+    elif data_manifest.distribution == 'categorical':
+        compute_cross_entropy = tf.nn.sparse_softmax_cross_entropy_with_logits(
+            labels=tf.reshape(targets, [-1]), logits=natural_params
+        )
+    elif data_manifest.distribution == 'CTC':
+        #########
+        # Why do we need to pad the symbol dimensions with a zero??
+        sequenced_natural_params = tf.pad(
+            sequenced_op_dict[np_key], tf.constant([[0, 0], [0, 0], [0, 1]])
+        )
+        #########
+
+        # the labels need to be a SparseTensor
+        sequenced_encoder_targets = tf.SparseTensor(
+            tf.cast(index_targets, tf.int64),
+            tf.reshape(targets, [-1]),
+            tf.cast(
+                [tf.shape(get_lengths)[0], tf.reduce_max(get_lengths)],
+                tf.int64
+            )
+        )
+
+        ####
+        # ugh: not actually a cross entropy...
+        ####
+        compute_cross_entropy = tf.compat.v1.nn.ctc_loss(
+            sequenced_encoder_targets,
+            inputs=sequenced_natural_params,
+            sequence_length=get_lengths,
+            preprocess_collapse_repeated=True,
+            ctc_merge_repeated=False,
+            time_major=False
+        )
+    else:
+        # raise NotImplementedError(
+        #    "Only Gaussian, categorical cross entropies have been impl.")
+        print('WARNING: unrecognized data_manifest.', end='')
+        print('distribution; not computing a cross entropy')
+        return
+
+    # average across elements of the batch
+    return tf.reduce_mean(compute_cross_entropy, 0)
+    ###return tf.reduce_sum(compute_cross_entropy, 0)

@@ -14,8 +14,11 @@ from scipy.special import logsumexp
 import tensorflow as tf
 import tensorflow_probability as tfp
 from tensorflow.python import pywrap_tensorflow
-from tensor2tensor.layers import common_layers
-from tensor2tensor.utils import beam_search as beam_search
+try:
+    from tensor2tensor.layers import common_layers
+    from tensor2tensor.utils import beam_search as beam_search
+except ModuleNotFoundError:
+    print('WARNING: tensor2tensor missing; skipping')
 try:
     import tfmpl
 except ModuleNotFoundError:
@@ -508,7 +511,7 @@ class SequenceNetwork:
         # apply to every *_target in the data_manifests
         for t_key, data_manifest in subnet_params.data_manifests.items():
             if '_targets' in t_key:
-                compute_cross_entropy = cross_entropy(
+                compute_cross_entropy = nn.cross_entropy(
                     t_key, data_manifest, sequenced_op_dict
                 )
                 tf.compat.v1.add_to_collection(
@@ -717,7 +720,7 @@ class SequenceNetwork:
         initial_values = [
             tf.constant(initial_initial_ind),
             {
-                swap(key, 'natural_params'): tf.fill([
+                nn.swap(key, 'natural_params'): tf.fill([
                     tf.shape(op)[0], tf.shape(op)[1],
                     params.data_manifests[key].num_features
                 ], 0.0)
@@ -733,7 +736,7 @@ class SequenceNetwork:
         shape_invariants = [
             tf.TensorShape([]),
             {
-                swap(key, 'natural_params'): tf.TensorShape([
+                nn.swap(key, 'natural_params'): tf.TensorShape([
                     None, None, params.data_manifests[key].num_features
                 ])
                 for key in sequenced_op_dict if '_targets' in key
@@ -769,15 +772,15 @@ class SequenceNetwork:
             if key.endswith('targets') and key.startswith('encoder'):
                 if data_manifest.distribution == 'categorical':
                     # no beam search for the encoder (but see notes)
-                    sequenced_op_dict[swap(key, 'beam_targets')] = \
+                    sequenced_op_dict[nn.swap(key, 'beam_targets')] = \
                         tf.transpose(sequenced_op_dict[key], perm=[0, 2, 1])
-                    sequenced_op_dict[swap(key, 'outputs')] = tf.expand_dims(
+                    sequenced_op_dict[nn.swap(key, 'outputs')] = tf.expand_dims(
                         tf.argmax(
-                            sequenced_op_dict[swap(key, 'natural_params')],
+                            sequenced_op_dict[nn.swap(key, 'natural_params')],
                             axis=2, output_type=tf.int32
                         ), 1
                     )
-                    sequenced_op_dict[swap(key, 'sequence_log_probs')] = \
+                    sequenced_op_dict[nn.swap(key, 'sequence_log_probs')] = \
                         tf.fill([tf.shape(sequenced_op_dict[key])[0], 1], 0.0)
 
         return sequenced_op_dict
@@ -905,15 +908,15 @@ class SequenceNetwork:
     def _update_token_assessments(
         self, key, sequenced_op_dict, params, index_targets, num_loops
     ):
-        sequenced_op_dict[swap(key, 'natural_params')] /= num_loops
+        sequenced_op_dict[nn.swap(key, 'natural_params')] /= num_loops
 
         # Only does something interesting for 'trial' data
-        (sequenced_op_dict[swap(key, 'beam_targets')],
-         sequenced_op_dict[swap(key, 'outputs')],
-         sequenced_op_dict[swap(key, 'sequence_log_probs')]
+        (sequenced_op_dict[nn.swap(key, 'beam_targets')],
+         sequenced_op_dict[nn.swap(key, 'outputs')],
+         sequenced_op_dict[nn.swap(key, 'sequence_log_probs')]
          ) = nn.fake_beam_for_sequence_targets(
             tf.squeeze(sequenced_op_dict[key], [1]),
-            tf.squeeze(sequenced_op_dict[swap(key, 'natural_params')], [1]),
+            tf.squeeze(sequenced_op_dict[nn.swap(key, 'natural_params')], [1]),
             params.data_manifests[key].get_feature_list(),
             self.beam_width, self.pad_token
         )
@@ -925,8 +928,8 @@ class SequenceNetwork:
     ):
         # convert: beam, sequence log probs -> token, all-word log probs
         desequenced_natural_params = nn.seq_log_probs_to_word_log_probs(
-            sequenced_op_dict[swap(key, 'outputs')],
-            sequenced_op_dict[swap(key, 'sequence_log_probs')],
+            sequenced_op_dict[nn.swap(key, 'outputs')],
+            sequenced_op_dict[nn.swap(key, 'sequence_log_probs')],
             params.data_manifests[key].num_features,
             index_targets, self.max_hyp_length,
             params.data_manifests[key].padding_value,
@@ -939,13 +942,13 @@ class SequenceNetwork:
             tf.shape(get_targets)[0], tf.shape(get_targets)[0],
             tf.shape(desequenced_natural_params)[-1]
         ]
-        sequenced_op_dict[swap(key, 'natural_params')] = tf.scatter_nd(
+        sequenced_op_dict[nn.swap(key, 'natural_params')] = tf.scatter_nd(
             index_targets, desequenced_natural_params, resequenced_shape
         )
 
         # To facilitate printing:
         #   (Ncases x max_ref_length x 1) -> (Ncases x 1 x max_ref_length)
-        sequenced_op_dict[swap(key, 'beam_targets')] = tf.transpose(
+        sequenced_op_dict[nn.swap(key, 'beam_targets')] = tf.transpose(
             sequenced_op_dict[key], perm=[0, 2, 1],
         )
 
@@ -1074,8 +1077,8 @@ class SequenceNetwork:
                 if t_key in params.data_manifests:
 
                     # useful strings
-                    np_key = swap(t_key, 'natural_params')
-                    subnet_name = swap(t_key, 'projection')
+                    np_key = nn.swap(t_key, 'natural_params')
+                    subnet_name = nn.swap(t_key, 'projection')
 
                     # penalize this output
                     desequence_RNN_outputs = tf.gather_nd(
@@ -1416,10 +1419,10 @@ class SequenceNetwork:
 
                 # <-log[q(outputs_d|inputs)]>_p(outputs_d,inputs),
                 # <-log[q(outputs_e|inputs)]>_p(outputs_e,inputs)
-                compute_cross_entropy = cross_entropy(
+                compute_cross_entropy = nn.cross_entropy(
                     key, data_manifest, sequenced_op_dict
                 )
-                ce_key = swap(key, 'cross_entropy')
+                ce_key = nn.swap(key, 'cross_entropy')
                 if ce_key in self.assessment_op_set:
                     compute_cross_entropy = tf.identity(
                         compute_cross_entropy, name='assess_' + ce_key
@@ -1443,7 +1446,7 @@ class SequenceNetwork:
 
         # gather some useful tensors
         sequenced_targets = sequenced_op_dict[key]
-        sequenced_natural_params = sequenced_op_dict[swap(key, 'natural_params')]
+        sequenced_natural_params = sequenced_op_dict[nn.swap(key, 'natural_params')]
         index_targets, _ = nn.sequences_tools(sequenced_targets)
         desequenced_targets = tf.cast(
             tf.gather_nd(sequenced_targets, index_targets), tf.int32
@@ -1475,15 +1478,15 @@ class SequenceNetwork:
             desequenced_natural_params, k=self.k_for_top_k_accuracy
         )
         predict_top_k_inds = tf.identity(
-            predict_top_k_inds, name='assess_%s' % swap(key, 'top_k_inds')
+            predict_top_k_inds, name='assess_%s' % nn.swap(key, 'top_k_inds')
         )
         assess_accuracies = tf.cast(
             tf.equal(predict_top_k_inds, desequenced_targets), tf.float32
         )
         average_accuracies = tf.reduce_mean(assess_accuracies, axis=0)
-        if swap(key, 'top_%i_accuracy' % self.k_for_top_k_accuracy) in self.summary_op_set:
+        if nn.swap(key, 'top_%i_accuracy' % self.k_for_top_k_accuracy) in self.summary_op_set:
             tf.compat.v1.summary.scalar(
-                'summarize_%s' % swap(
+                'summarize_%s' % nn.swap(
                     key, 'top_%i_accuracy' % self.k_for_top_k_accuracy
                 ),
                 tf.reduce_sum(average_accuracies)
@@ -1491,11 +1494,11 @@ class SequenceNetwork:
 
         # <\delta{outputs_d - argmax_a[q(a|inputs)]}>_p(outputs_d,inputs)
         assess_average_accuracy = tf.gather(
-            average_accuracies, 0, name='assess_%s' % swap(key, 'accuracy')
+            average_accuracies, 0, name='assess_%s' % nn.swap(key, 'accuracy')
         )
-        if swap(key, 'accuracy') in self.summary_op_set:
+        if nn.swap(key, 'accuracy') in self.summary_op_set:
             tf.compat.v1.summary.scalar(
-                'summarize_%s' % swap(key, 'accuracy'), assess_average_accuracy
+                'summarize_%s' % nn.swap(key, 'accuracy'), assess_average_accuracy
             )
 
         return assess_accuracies, predict_top_k_inds
@@ -1503,11 +1506,11 @@ class SequenceNetwork:
     def _write_word_error_rates(self, key, sequenced_op_dict, params):
 
         # the tensors required to compute a word error rate
-        sequenced_outputs = sequenced_op_dict[swap(key, 'outputs')]
-        sequenced_beam_targets = sequenced_op_dict[swap(key, 'beam_targets')]
+        sequenced_outputs = sequenced_op_dict[nn.swap(key, 'outputs')]
+        sequenced_beam_targets = sequenced_op_dict[nn.swap(key, 'beam_targets')]
         sequence_log_probs = tf.identity(
-            sequenced_op_dict[swap(key, 'sequence_log_probs')],
-            name='assess_%s' % swap(key, 'sequence_log_probs')
+            sequenced_op_dict[nn.swap(key, 'sequence_log_probs')],
+            name='assess_%s' % nn.swap(key, 'sequence_log_probs')
         )
 
         # minimum normalized edit distance between sequences of words
@@ -1521,7 +1524,7 @@ class SequenceNetwork:
             EXCLUDE_EOS=True, eos_id=eos_id
         )
         assess_word_error_rate = tf.reduce_mean(
-            get_word_error_rates, name='assess_%s' % swap(key, 'word_error_rate')
+            get_word_error_rates, name='assess_%s' % nn.swap(key, 'word_error_rate')
         )
         ######
         # FIX ME
@@ -1531,9 +1534,9 @@ class SequenceNetwork:
         # assess_word_error_rate = EMA.apply(tf.compat.v1.get_collection('my_collection'))
         ######
 
-        if swap(key, 'word_error_rate') in self.summary_op_set:
+        if nn.swap(key, 'word_error_rate') in self.summary_op_set:
             tf.compat.v1.summary.scalar(
-                'summarize_%s' % swap(key, 'word_error_rate'),
+                'summarize_%s' % nn.swap(key, 'word_error_rate'),
                 assess_word_error_rate
             )
 
@@ -1555,7 +1558,7 @@ class SequenceNetwork:
             )
             confusions = tf.divide(
                 xpct_pvec_qvec_unnorm, xpct_pvec_unnorm,
-                name='assess_%s' % swap(key, 'confusions')
+                name='assess_%s' % nn.swap(key, 'confusions')
             )
         else:
             # get confusions and supply a name to the op
@@ -1564,10 +1567,10 @@ class SequenceNetwork:
                 predictions=predict_top_k_inds[:, 0],
                 num_classes=num_target_features)
             confusions = tf.identity(
-                confusions, name='assess_%s' % swap(key, 'confusions')
+                confusions, name='assess_%s' % nn.swap(key, 'confusions')
             )
 
-        image_key = swap(key, 'confusions_image')
+        image_key = nn.swap(key, 'confusions_image')
         if image_key in self.summary_op_set:
             tf.compat.v1.summary.image(
                 'summarize_%s' % image_key,
@@ -1581,7 +1584,7 @@ class SequenceNetwork:
     def _write_frequency_normalized_stats(self, key, confusions):
 
         # EXPECTED frequency-normalized accuracy
-        xpct_key = swap(key, 'xpct_normalized_accuracy')
+        xpct_key = nn.swap(key, 'xpct_normalized_accuracy')
         target_frequencies = tf.reduce_sum(confusions, axis=1)
         where_targets = tf.cast(
             tf.compat.v1.where(target_frequencies > 0), tf.int32
@@ -1599,7 +1602,7 @@ class SequenceNetwork:
             )
 
         # VARIANCE of the frequency-normalized accuracy
-        vrnc_key = swap(key, 'vrnc_normalized_accuracy')
+        vrnc_key = nn.swap(key, 'vrnc_normalized_accuracy')
         assess_vrnc_frequency_normalized_accuracy = tf.reduce_mean(
             tf.math.squared_difference(
                 frequency_normalized_accuracies,
@@ -1617,7 +1620,7 @@ class SequenceNetwork:
     ):
 
         # the average entropy of the *output distribution*
-        s_key = swap(key, 'entropy')
+        s_key = nn.swap(key, 'entropy')
         if s_key in self.summary_op_set:
             C = tf.reduce_logsumexp(desequenced_natural_params, axis=1)
             decoder_probs = tf.nn.softmax(desequenced_natural_params)
@@ -1631,7 +1634,7 @@ class SequenceNetwork:
             return
 
         # and does it correlate with accuracy?
-        s_key = swap(key, 'calibration')
+        s_key = nn.swap(key, 'calibration')
         if s_key in self.summary_op_set:
             acc_entropy_corr = tfp.stats.correlation(
                 assess_accuracies[:, 0], assess_entropies, event_axis=None)
@@ -1640,7 +1643,7 @@ class SequenceNetwork:
             )
 
         # also *look* at the relationship
-        s_key = swap(key, 'calibration_image')
+        s_key = nn.swap(key, 'calibration_image')
         if s_key in self.summary_op_set:
             num_target_features = params.data_manifests[key].num_features
             tf.compat.v1.summary.image(s_key, dual_violin_plot(
@@ -2149,83 +2152,6 @@ class TargetFilter:
                 ))
         else:
             return dataset
-
-
-def cross_entropy(key, data_manifest, sequenced_op_dict):
-    '''
-    ...
-
-    In fact, this function *averages*, rather than sums, across all features
-    given by a particular key.  Although the result is not technically the
-    cross entropy of the output, it is more easily comparable across keys and
-    therefore facilitates the design of penalty_scales.
-    '''
-
-    # desequence the targets and natural_params
-    # NB that this enforces that the lengths of the predicted and actual
-    #  sequences match.  This is of course *not* enforced when calculating the
-    #  word error rate, which is anyway computed from 'decoder_outputs', not
-    #  'decoder_natural_params'.
-    index_targets, get_lengths = nn.sequences_tools(sequenced_op_dict[key])
-    targets = tf.gather_nd(sequenced_op_dict[key], index_targets)
-    np_key = swap(key, 'natural_params')
-    natural_params = tf.gather_nd(sequenced_op_dict[np_key], index_targets)
-
-    # the form of the cross-entropy depends on the distribution
-    if data_manifest.distribution == 'Gaussian':
-        # average across features (axis=1)
-        compute_cross_entropy = tf.reduce_mean(
-            tf.square(natural_params - targets), 1)/2
-    elif data_manifest.distribution == 'categorical':
-        compute_cross_entropy = tf.nn.sparse_softmax_cross_entropy_with_logits(
-            labels=tf.reshape(targets, [-1]), logits=natural_params
-        )
-    elif data_manifest.distribution == 'CTC':
-        #########
-        # Why do we need to pad the symbol dimensions with a zero??
-        sequenced_natural_params = tf.pad(
-            sequenced_op_dict[np_key], tf.constant([[0, 0], [0, 0], [0, 1]])
-        )
-        #########
-
-        # the labels need to be a SparseTensor
-        sequenced_encoder_targets = tf.SparseTensor(
-            tf.cast(index_targets, tf.int64),
-            tf.reshape(targets, [-1]),
-            tf.cast(
-                [tf.shape(get_lengths)[0], tf.reduce_max(get_lengths)],
-                tf.int64
-            )
-        )
-
-        ####
-        # ugh: not actually a cross entropy...
-        ####
-        compute_cross_entropy = tf.compat.v1.nn.ctc_loss(
-            sequenced_encoder_targets,
-            inputs=sequenced_natural_params,
-            sequence_length=get_lengths,
-            preprocess_collapse_repeated=True,
-            ctc_merge_repeated=False,
-            time_major=False
-        )
-    else:
-        # raise NotImplementedError(
-        #    "Only Gaussian, categorical cross entropies have been impl.")
-        print('WARNING: unrecognized data_manifest.', end='')
-        print('distribution; not computing a cross entropy')
-        return
-
-    # average across elements of the batch
-    return tf.reduce_mean(compute_cross_entropy, 0)
-    ###return tf.reduce_sum(compute_cross_entropy, 0)
-
-
-def swap(key, string):
-    # In SequenceNetworks, keys are often constructed from the data_manifest
-    #  key by swapping out the word 'targets' for some other string.  This is
-    #  just a shortcut for that process.
-    return key.replace('targets', string)
 
 
 def data_augmentor(sequenced_op_dict, keyword):
