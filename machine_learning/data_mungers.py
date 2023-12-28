@@ -144,119 +144,16 @@ class SplitMNIST(torchvision.datasets.MNIST):
 
         return image
 
-#####
-# DEPRECATED: too slow
-# Importing tfrecords into pytorch
-#####
-class TFRecordPipe:
-    from machine_learning.torch_helpers import parse_protobuf_seq2seq_example
-    from torchdata.datapipes.iter import FileLister, FileOpener 
-    from tfrecord.torch.dataset import MultiTFRecordDataset
-
-    def __init__(
-        self,
-        #####
-        # for now, just one
-        subject
-        #####
-    ):
-        self.data_manifests = subject.data_manifests
-        self.partial_path = subject.data_generator.tf_record_partial_path
-        self.block_ids = subject.block_ids
-
-    def parse_protobuf(self, example_proto):
-        '''
-        Resizes data and converts words to indices.  NB that all matrices in
-        the example_dict have size [T x N_features]
-        '''
-
-        example_dict = TFRecordPipe.parse_protobuf_seq2seq_example(
-            example_proto, self.data_manifests,
-        )    
-
-        return example_dict
-
-    def pad_collate(self, batch):
-        '''
-        Transforms 
-          list of dictionaries of variable-length sequences
-        into
-          dictionary of tensors
-        (padded to account for variable lengths)
-
-        Each example in the batch is a dict.  Each value in the dict has size
-            (T_i x N_features).
-        where T_i is the length of that particular example.  The elements of
-        the output, batch_dict, have size
-            (batch_size x T x N_features),
-        where T is the length of the longest sequence in the batch.
-        '''
-
-        batch_dict = {
-             key: torch.nn.utils.rnn.pad_sequence(
-                # [torch.tensor(example[key]) for example in batch],
-                [example[key] for example in batch],
-                batch_first=True,
-                padding_value=self.data_manifests[key].padding_value
-             ) for key in self.data_manifests.keys()
-        }
-               
-        return batch_dict
-    
-    def construct_pipe(self):
-        # vahidk or pytorch version?  Both very slow
-        return self.construct_pipe_v()
-        return self.construct_pipe_t()
-
-    def construct_pipe_v(self):
-        # ...
-        # index_pattern = self.partial_path.replace('.tfrecord', '.tfindex')
-        # description = {
-        #     'ecog_sequence': 'float',
-        #     'phoneme_sequence': 'byte',
-        #     'text_sequence': 'byte',
-        #     "audio_sequence": 'float',
-        # }
-        
-        # unnormalized probabilities
-        splits = {block: 1.0 for block in self.block_ids['training']}
-
-        # ...
-        dataset = MultiTFRecordDataset(
-            self.partial_path,
-            index_pattern=None,
-            splits=splits,
-            description=None,
-            infinite=False,
-            transform=self.parse_protobuf,
-            shuffle_queue_size=512,
-        )
-        return dataset
-
-    def construct_pipe_t(self):
-        tf_record_dir, tf_record_name = os.path.split(self.partial_path)
-        datapipe = FileLister(tf_record_dir, tf_record_name.format('*'))
-        datapipe = FileOpener(datapipe, mode="b")
-        datapipe = datapipe.load_from_tfrecord()
-        datapipe = datapipe.shuffle()
-        datapipe = datapipe.sharding_filter()
-        datapipe = datapipe.map(self.parse_protobuf)
-
-    #     # train, valid = tfrecord_datapipe.random_split(
-    #     #     # total_length=10,
-    #     #     weights={"train": 0.8, "valid": 0.2}, seed=0
-    #     # )
-
-    #     return datapipe
-
 
 class TFRecordDataLoader:
     def __init__(self, subnets_params, data_partition, batch_size):
+
+        # don't let TF allocate the GPU to itself
+        tf.config.set_visible_devices([], 'GPU')
         ds = self._tf_records_to_dataset(
             subnets_params, data_partition, batch_size,
             # num_shards_to_discard=0, DROP_REMAINDER=False
         )
-
         N_batches = 0
         for batch in ds:
             N_batches += 1
@@ -302,14 +199,9 @@ class TFRecordDataLoader:
                 lambda example_proto: _parse_protobuf_seq2seq_example(
                     example_proto, subnet_params.data_manifests
                 ),
-                num_parallel_calls=tf.data.experimental.AUTOTUNE
+                num_parallel_calls=tf.data.AUTOTUNE
             )
-            #########
-            # Insane tensorflow bug: "num_parallel_calls" cannot be moved to
-            #  the preceding line (after the comma), and results in extremely
-            #  erratic behavior (especially in conjunction with Jupyter)
-            #########
-
+            
             # filter data to include or exclude only specified decoder targets?
             decoder_targets_list = subnet_params.data_manifests[
                 'decoder_targets'].get_feature_list()
@@ -345,13 +237,13 @@ class TFRecordDataLoader:
             )
 
             # add id for "proprietary" parts of network under transfer learning
-            # dataset = dataset.map(
-            #     lambda batch_of_protos_dict: {
-            #         **batch_of_protos_dict,
-            #         'subnet_id': tf.constant(
-            #             subnet_params.subnet_id, dtype=tf.int32)
-            #     }
-            # )
+            dataset = dataset.map(
+                lambda batch_of_protos_dict: {
+                    **batch_of_protos_dict, 'subnet_id': tf.constant(
+                        str(subnet_params.subnet_id), dtype=tf.string
+                    )
+                }
+            )
             dataset_list.append(dataset)
 
         # (randomly) interleave (sub-)batches w/o throwing anything away
@@ -366,7 +258,7 @@ class TFRecordDataLoader:
         #  recommends batching first, and applying a vectorized version of
         #  parse_protobuf_seq2seq_example.  But you shuffle first.....
         ######
-        dataset = dataset.prefetch(tf.data.experimental.AUTOTUNE) #num_cases)
+        dataset = dataset.prefetch(tf.data.AUTOTUNE)  #num_cases)
 
         return dataset
 
@@ -454,3 +346,108 @@ class TargetFilter:
         else:
             return dataset
 
+
+#####
+# DEPRECATED: too slow
+# Importing tfrecords into pytorch
+#####
+# class TFRecordPipe:
+#     from machine_learning.torch_helpers import parse_protobuf_seq2seq_example
+#     from torchdata.datapipes.iter import FileLister, FileOpener 
+#     from tfrecord.torch.dataset import MultiTFRecordDataset
+
+#     def __init__(
+#         self,
+#         #####
+#         # for now, just one
+#         subject
+#         #####
+#     ):
+#         self.data_manifests = subject.data_manifests
+#         self.partial_path = subject.data_generator.tf_record_partial_path
+#         self.block_ids = subject.block_ids
+
+#     def parse_protobuf(self, example_proto):
+#         '''
+#         Resizes data and converts words to indices.  NB that all matrices in
+#         the example_dict have size [T x N_features]
+#         '''
+
+#         example_dict = TFRecordPipe.parse_protobuf_seq2seq_example(
+#             example_proto, self.data_manifests,
+#         )    
+
+#         return example_dict
+
+#     def pad_collate(self, batch):
+#         '''
+#         Transforms 
+#           list of dictionaries of variable-length sequences
+#         into
+#           dictionary of tensors
+#         (padded to account for variable lengths)
+
+#         Each example in the batch is a dict.  Each value in the dict has size
+#             (T_i x N_features).
+#         where T_i is the length of that particular example.  The elements of
+#         the output, batch_dict, have size
+#             (batch_size x T x N_features),
+#         where T is the length of the longest sequence in the batch.
+#         '''
+
+#         batch_dict = {
+#              key: torch.nn.utils.rnn.pad_sequence(
+#                 # [torch.tensor(example[key]) for example in batch],
+#                 [example[key] for example in batch],
+#                 batch_first=True,
+#                 padding_value=self.data_manifests[key].padding_value
+#              ) for key in self.data_manifests.keys()
+#         }
+               
+#         return batch_dict
+    
+#     def construct_pipe(self):
+#         # vahidk or pytorch version?  Both very slow
+#         return self.construct_pipe_v()
+#         return self.construct_pipe_t()
+
+#     def construct_pipe_v(self):
+#         # ...
+#         # index_pattern = self.partial_path.replace('.tfrecord', '.tfindex')
+#         # description = {
+#         #     'ecog_sequence': 'float',
+#         #     'phoneme_sequence': 'byte',
+#         #     'text_sequence': 'byte',
+#         #     "audio_sequence": 'float',
+#         # }
+        
+#         # unnormalized probabilities
+#         splits = {block: 1.0 for block in self.block_ids['training']}
+
+#         # ...
+#         dataset = MultiTFRecordDataset(
+#             self.partial_path,
+#             index_pattern=None,
+#             splits=splits,
+#             description=None,
+#             infinite=False,
+#             transform=self.parse_protobuf,
+#             shuffle_queue_size=512,
+#         )
+#         return dataset
+
+#     def construct_pipe_t(self):
+#         tf_record_dir, tf_record_name = os.path.split(self.partial_path)
+#         datapipe = FileLister(tf_record_dir, tf_record_name.format('*'))
+#         datapipe = FileOpener(datapipe, mode="b")
+#         datapipe = datapipe.load_from_tfrecord()
+#         datapipe = datapipe.shuffle()
+#         datapipe = datapipe.sharding_filter()
+#         datapipe = datapipe.map(self.parse_protobuf)
+
+#     #     # train, valid = tfrecord_datapipe.random_split(
+#     #     #     # total_length=10,
+#     #     #     weights={"train": 0.8, "valid": 0.2}, seed=0
+#     #     # )
+
+#     #     return datapipe

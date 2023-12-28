@@ -354,8 +354,10 @@ class SequenceNetwork:
 
         def training_net_builder(GPU_op_dict, CPU_op_dict, tower_name):
 
-            tf.transpose(a=GPU_op_dict['decoder_targets'], perm=[0, 2, 1],
-                         name='assess_decoder_targets')
+            tf.transpose(
+                a=GPU_op_dict['decoder_targets'], perm=[0, 2, 1],
+                name='assess_decoder_targets'
+            )
 
             total_loss, train_vars = self._build_training_net(
                 GPU_op_dict, CPU_op_dict, subnets_params,
