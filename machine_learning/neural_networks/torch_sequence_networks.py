@@ -83,6 +83,7 @@ class Sequence2Sequence(nn.Module):
         max_hyp_length=20,
         coupling='final_state',
         RNN_type='LSTM',
+        VERBOSE=True,
     ):
         super().__init__()
 
@@ -98,12 +99,13 @@ class Sequence2Sequence(nn.Module):
         self.EOS_id = self.decoder_targets_list.index(self.EOS_token)
         self.pad_id = self.decoder_targets_list.index(self.pad_token)
 
-        print('USING %s IN THE RNNs' % RNN_type)
+        self.vprint('USING %s IN THE RNNs' % RNN_type)
 
         # ENCODER
         self.encoder = EncoderRNN(
             self.layer_sizes, self.FF_dropout, self.RNN_dropout, subnets_params,
-            ENCODER_RNN_IS_BIDIRECTIONAL, RNN_type, coupling=coupling
+            ENCODER_RNN_IS_BIDIRECTIONAL, RNN_type, coupling=coupling,
+            VERBOSE=VERBOSE
         )
 
         # reshape the context to pass to the decoder
@@ -117,14 +119,14 @@ class Sequence2Sequence(nn.Module):
         )
 
         # DECODER
-        print('COUPLING ENCODER TO DECODER WITH ', end='')
+        self.vprint('COUPLING ENCODER TO DECODER WITH ', end='')
         match coupling:
             case 'final_state':
                 Decoder = DecoderRNN
-                print('FINAL HIDDEN STATE')
+                self.vprint('FINAL HIDDEN STATE')
             case 'attention':
                 Decoder = DecoderAttentionRNN
-                print('ATTENTION')
+                self.vprint('ATTENTION')
             case _:
                 raise ValueError('Unrecognized decoder_type')
         self.decoder = Decoder(
@@ -224,6 +226,10 @@ class Sequence2Sequence(nn.Module):
                 wer_vector(accumulated_targets, accumulated_predictions)
             ))
 
+    def vprint(self, *args, **kwargs):
+        if self.VERBOSE:
+            print(*args, **kwargs)
+
 
 class EncoderRNN(nn.Module):
     def __init__(
@@ -236,6 +242,7 @@ class EncoderRNN(nn.Module):
         RNN_type,
         coupling=None,
         MAX_POOL=False,
+        VERBOSE=True,
     ):
         super().__init__()
 
@@ -260,7 +267,7 @@ class EncoderRNN(nn.Module):
             self.embeddings[subnet_id] = MLConvEmbedding(
                 subnet_params.data_manifests['encoder_inputs'].num_features,
                 layer_sizes['encoder_embedding'], subnet_params,
-                self.FF_dropout, MAX_POOL
+                self.FF_dropout, MAX_POOL, VERBOSE=VERBOSE
             )
 
             # decimation_factors
@@ -690,6 +697,7 @@ class MLConvEmbedding(nn.Module):
         subnet_params,
         dropout,
         MAX_POOL=False,
+        VERBOSE=True,
     ):
         super().__init__()
 
@@ -702,7 +710,8 @@ class MLConvEmbedding(nn.Module):
         
         # distribute decimation over multiple layers
         layer_strides = close_factors(self.decimation_factor, len(layer_sizes))
-        print('Temporally convolving with strides ' + repr(layer_strides))
+        if VERBOSE:
+            print('Temporally convolving with strides ' + repr(layer_strides))
         
         # construct embedding network
         for N_out, layer_stride in zip(layer_sizes, layer_strides):
@@ -880,29 +889,19 @@ class SequenceTrainer():
             device_batch, natural_params_dict, loss_fxn_dict, epoch_loss_dict
         ):
 
-            ############
-            # It would be nice to rationalize this, get "batch" out of here;
-            #  But this is nontrivial.
-            ############
+            # overkill but organized this way for "elegance"
+            metadata_dicts = dict.fromkeys(['encoder', 'decoder'])
+            for coder in metadata_dicts.keys():
 
-            #####
-            # you may have to take this off the GPU
-            subnet_id = device_batch['subnet_id'].decode()
-            #####
-            decimation_factor = sequence_net.encoder.decimation_factors[subnet_id]
-
-            # get targets indices/lengths
-            ######
-            # This is redundant but the alternative is to pass them around....
-            targets_indices = dict.fromkeys(['encoder', 'decoder'])
-            targets_lengths = dict.fromkeys(['encoder', 'decoder'])
-            targets_indices['encoder'], targets_lengths['encoder'] = sequences_tools(
-                device_batch['encoder_inputs'][:, ::decimation_factor, :]
-            )
-            ######
-            targets_indices['decoder'], targets_lengths['decoder'] = sequences_tools(
-                device_batch['decoder_targets']
-            )
+                metadata_dicts[coder] = {}
+                if coder == 'encoder':
+                    d = sequence_net.encoder.decimation_factors[device_batch['subnet_id']]
+                    inds, lens = sequences_tools(device_batch['encoder_inputs'][:, ::d, :])
+                    metadata_dicts[coder]['decimation_factor'] = d
+                else:
+                    inds, lens = sequences_tools(device_batch['decoder_targets'])
+                metadata_dicts[coder]['indices'] = inds
+                metadata_dicts[coder]['lengths'] = lens
 
             # compute losses
             complete_loss = 0
@@ -911,12 +910,13 @@ class SequenceTrainer():
                 # assemble the targets, their indices, and lengths
                 coder = key.split('_')[0]
                 targets = device_batch[key]
-                indices = targets_indices[coder]
-                lengths = targets_lengths[coder]
+                indices = metadata_dicts[coder]['indices']
+                lengths = metadata_dicts[coder]['lengths']
 
                 # *encoder* targets are decimated and possibly reversed
                 if coder == 'encoder':
-                    targets = targets[:, ::decimation_factor, :]
+                    d = metadata_dicts[coder]['decimation_factor']
+                    targets = targets[:, ::d, :]
                     if sequence_net.coupling == 'final_state':
                         targets = reverse_sequences(targets, indices, lengths)
 
@@ -965,16 +965,14 @@ class SequenceTrainer():
         epoch_loss_dict = {}
         for batch in self.loaders['training']:
 
-            # which subject/subnet is this?
-            subnet_id = batch['subnet_id'].decode()
-
             # put the data on (presumably) the GPU and pass thru network
             device_batch = {
-                key: torch.tensor(array).to(device)
-                for key, array in batch.items()
+                key: val.decode() if key == 'subnet_id'
+                else torch.tensor(val).to(device)
+                for key, val in batch.items()
             }
             natural_params_dict, image_dict = net(
-                device_batch['encoder_inputs'], subnet_id,
+                device_batch['encoder_inputs'], device_batch['subnet_id'],
                 device_batch['decoder_targets'][:, :, 0]
             )
             
@@ -985,7 +983,7 @@ class SequenceTrainer():
             optimizer.zero_grad()
             loss = batch_op_core(
                 device_batch, natural_params_dict,
-                net.loss_fxn_dicts[subnet_id], epoch_loss_dict
+                net.loss_fxn_dicts[device_batch['subnet_id']], epoch_loss_dict
             )
 
             # backprop and take a step downhill
@@ -1014,19 +1012,17 @@ class SequenceTrainer():
         with torch.no_grad():
             for batch in self.loaders[data_partition]:
 
-                # which subject/subnet is this?
-                subnet_id = batch['subnet_id'].decode()
-
                 # put the data on (presumably) the GPU and pass thru network
                 device_batch = {
-                    key: torch.tensor(array).to(device)
-                    for key, array in batch.items()
+                    key: val.decode() if key == 'subnet_id'
+                    else torch.tensor(val).to(device)
+                    for key, val in batch.items()
                 }
 
                 # put the data on (presumably) the GPU and pass thru network; 
                 # DO NOT PASS TARGETS
                 natural_params_dict, image_dict = net(
-                    device_batch['encoder_inputs'], subnet_id
+                    device_batch['encoder_inputs'], device_batch['subnet_id']
                 )
 
                 # accumulate total number of examples
@@ -1035,7 +1031,7 @@ class SequenceTrainer():
                 # update losses in epoch_loss_dict
                 batch_op_core(
                     device_batch, natural_params_dict,
-                    net.loss_fxn_dicts[subnet_id], epoch_loss_dict
+                    net.loss_fxn_dicts[device_batch['subnet_id']], epoch_loss_dict
                 )
 
                 # only consider the single sequence of most probable classes
@@ -1055,10 +1051,8 @@ class SequenceTrainer():
 
                 # just evaluate on a single batch
                 break
-
-        ###########
-        # should warn or etc. if the data loader is empty!!
-        ###########
+            else:
+                raise ValueError('No %s data!' % data_partition)
 
         # report cross entropy(s)
         print('[assessment]  epoch: %3i ' % epoch, end='')
