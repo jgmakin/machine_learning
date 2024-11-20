@@ -414,8 +414,8 @@ class FinalStateClassifier(nn.Module):
         natural_params_dict, image_dict
     ):
         '''
-        encoder_rnn_outputs aren't necessary but are included here for
-        consistency with DecoderAttentionRNN
+        encoder_rnn_outputs, targets, and natural_params_dict aren't necessary
+        but are included here for consistency with DecoderAttentionRNN
         '''
 
         # use only hidden states, not cell states
