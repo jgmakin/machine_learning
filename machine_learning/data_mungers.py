@@ -214,12 +214,14 @@ class TFRecordDataLoader:
             # # filter out words not in the decoder_targets_list
             # ######
             # # FIX ME
-            # if False:  # not self.TARGETS_ARE_SEQUENCES:
-            #     OOV_id = (decoder_targets_list.index(self.OOV_token)
-            #               if self.OOV_token in decoder_targets_list else -1)
-            #     dataset = dataset.filter(
-            #         lambda encoder_input, decoder_target, encoder_target, s_id:
-            #             tf.not_equal(decoder_target[0], OOV_id))
+            if True:  # not self.TARGETS_ARE_SEQUENCES:
+                OOV_id = (
+                    decoder_targets_list.index(self.OOV_token)
+                    if self.OOV_token in decoder_targets_list else -1
+                )
+                dataset = dataset.filter(
+                    lambda encoder_input, decoder_target, encoder_target, s_id:
+                        tf.not_equal(decoder_target[0], OOV_id))
             # ######
 
             # discard some of the data?; shuffle; batch (evening out w/padding)

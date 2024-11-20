@@ -10,7 +10,7 @@ if python_subversion > 8:
     install_requires = [
         'numpy', 'scipy', 'tensorflow', 'tensorflow-probability',
         'tensorflow-datasets', 'torch', 'torchvision', 'seaborn',
-        'matplotlib',
+        'matplotlib', 'tensorflow-datasets'
     ]
 else:
     install_requires = [

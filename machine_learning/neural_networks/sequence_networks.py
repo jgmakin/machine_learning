@@ -107,7 +107,7 @@ class SequenceNetwork:
         #####
         # kwargs set in the manifest
         temperature=None,
-        Nepochs=None,
+        N_epochs=None,
         layer_sizes=None,
         FF_dropout=None,
         RNN_dropout=None,
@@ -117,7 +117,7 @@ class SequenceNetwork:
         assessment_epoch_interval=None,
         tf_summaries_dir=None,
         #####
-        Ncases=256,
+        N_cases=256,
         stiffness=0,
         beam_alpha=0.6,
         max_hyp_length=20,
@@ -266,7 +266,7 @@ class SequenceNetwork:
             optimizer = tf.contrib.opt.AdamWOptimizer(
                 weight_decay=0.01,
                 learning_rate=10*self.compute_learning_rate(
-                    subnets_params, self.Ncases, 813)/2
+                    subnets_params, self.N_cases, 813)/2
             )
             '''
 
@@ -316,7 +316,7 @@ class SequenceNetwork:
         graph_builder = tfh.GraphBuilder(
             training_data_fxn, assessment_data_fxn, training_net_builder,
             assessment_net_builder, optimizer, assessor, self.checkpoint_path,
-            self.Nepochs,
+            self.N_epochs,
             EMA_decay=self.EMA_decay, reuse_vars_scope=reuse_vars_scope,
             training_GPUs=self.training_GPUs, assessment_GPU=self.assessment_GPU,
             **graph_kwargs
@@ -949,7 +949,7 @@ class SequenceNetwork:
         )
 
         # To facilitate printing:
-        #   (Ncases x max_ref_length x 1) -> (Ncases x 1 x max_ref_length)
+        #   (N_cases x max_ref_length x 1) -> (N_cases x 1 x max_ref_length)
         sequenced_op_dict[nn.swap(key, 'beam_targets')] = tf.transpose(
             sequenced_op_dict[key], perm=[0, 2, 1],
         )
@@ -1308,17 +1308,17 @@ class SequenceNetwork:
     ):
         '''
         To embed sequence data, you have first to de-sequence them, from
-            [Ncases x max_sequence_length x len(single token vector)]
+            [N_cases x max_sequence_length x len(single token vector)]
         to
-            [\sum_i^Ncases sequence_length_i x len(single token vector)].
+            [\sum_i^N_cases sequence_length_i x len(single token vector)].
         Then you "embed" into a matrix of size
-            [\sum_i^Ncases sequence_length_i x N_embedding_dims].
+            [\sum_i^N_cases sequence_length_i x N_embedding_dims].
         Finally, you re-sequence into
-            [Ncases x max_sequence_length x N_embedding_dims].
+            [N_cases x max_sequence_length x N_embedding_dims].
 
         Note that the outputs of an RNN with this input are in a sense
         also de-sequenced, since they have size
-            [Ncases x Nhiddens].
+            [N_cases x N_hiddens].
         '''
 
         # Ns
@@ -1781,7 +1781,7 @@ class SequenceNetwork:
 
             # create an iterator across batches from the tf_records
             dataset = self._tf_records_to_dataset(
-                subnets_params, data_partition, self.Ncases,
+                subnets_params, data_partition, self.N_cases,
                 self.num_training_shards_to_discard
             )
             iterator = tf.compat.v1.data.make_initializable_iterator(dataset)
@@ -1938,8 +1938,8 @@ class SequenceNetwork:
 
         return dataset
 
-    def compute_learning_rate(self, subnets_params, Ncases_total=None):
-        if not Ncases_total:
+    def compute_learning_rate(self, subnets_params, N_cases_total=None):
+        if not N_cases_total:
             data_graph = tf.Graph()
             with data_graph.as_default():
                 dataset = tf.data.TFRecordDataset([
@@ -1948,8 +1948,8 @@ class SequenceNetwork:
                     for block_id in subnet_params.block_ids['training']
                 ])
                 count_records = dataset.reduce(0, lambda x, _: x + 1)
-                Ncases_total = tf.compat.v1.Session().run(count_records)
-        learning_rate = self.temperature/Ncases_total
+                N_cases_total = tf.compat.v1.Session().run(count_records)
+        learning_rate = self.temperature/N_cases_total
         print('learning rate is %f' % learning_rate)
 
         return learning_rate

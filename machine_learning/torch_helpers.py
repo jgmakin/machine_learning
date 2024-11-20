@@ -175,7 +175,7 @@ def sequences_tools(sequences, as_tuple=True):
     Input arguments:
     --------
     sequences:
-        tensor of size (Ncases x max_sequence_length x Ndims)
+        tensor of size (N_cases x max_sequence_length x Ndims)
 
     Returns:
     --------
@@ -183,10 +183,10 @@ def sequences_tools(sequences, as_tuple=True):
         (sum_i^Nsequences seq_len(i) x 2) tensor listing all the non-zero
         indices in the tensor of sequences
     sequences_lengths:
-        int32 tensor of size (Ncases)
+        int32 tensor of size (N_cases)
     '''
 
-    # mask_binariwise is a (Ncases x max_sequence_length) matrix with 0s
+    # mask_binariwise is a (N_cases x max_sequence_length) matrix with 0s
     #  wherever all elements of an input token are simultaneously zero,
     #  and 1s elsewhere.  Since all elements of an input token are
     #  simultaneously zero only in the zero-padding, the 1s will be

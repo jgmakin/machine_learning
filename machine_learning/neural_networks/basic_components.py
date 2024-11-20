@@ -176,7 +176,7 @@ def LSTM_rnn(
     # Borrowed from the tensor2tensor library, and modified
     '''
     Run LSTM cell on inputs, assuming they have size
-    [Ncases x max_sequence_length x Ninputs].
+    [N_cases x max_sequence_length x Ninputs].
 
     Input arguments:
     -------
@@ -341,7 +341,7 @@ def sequences_tools(sequences):
     Input arguments:
     --------
     sequences:
-        tensor of size (Ncases x max_sequence_length x Ndims)
+        tensor of size (N_cases x max_sequence_length x Ndims)
 
     Returns:
     --------
@@ -349,10 +349,10 @@ def sequences_tools(sequences):
         (sum_i^Nsequences seq_len(i) x 2) tensor listing all the non-zero
         indices in the tensor of sequences
     get_sequences_lengths:
-        int32 tensor of size (Ncases)
+        int32 tensor of size (N_cases)
     '''
 
-    # mask_binariwise is a (Ncases x max_sequence_length) matrix with 0s
+    # mask_binariwise is a (N_cases x max_sequence_length) matrix with 0s
     #  wherever all elements of an input token are simultaneously zero,
     #  and 1s elsewhere.  Since all elements of an input token are
     #  simultaneously zero only in the zero-padding, the 1s will be
@@ -371,7 +371,7 @@ def sequences_tools(sequences):
 def occlude_sequence_features(get_sequences, occluded_features):
     '''
     For all sequences in the zero-padded tensor get_sequences (with shape
-    (Ncases x T_max x Nfeatures), replace the features labeled by index in
+    (N_cases x T_max x Nfeatures), replace the features labeled by index in
     occluded_features with their average values (exlcuding the zero-padding,
     of course).
     '''
@@ -401,15 +401,15 @@ def tf_expected_word_error_rates(
 ):
     '''
     Compute word error rate on the results of a beam search.  In particular,
-    tile the references to the beam size, and reshape into (Ncases*beam_width
+    tile the references to the beam size, and reshape into (N_cases*beam_width
     x max_sequence_length); then compute the word error rate in a vectorized
     way.
 
     Input arguments:
     --------
-    references: (Ncases x 1 x max_ref_length)
-    hypotheses: (Ncases x beam_width x max_hyp_length)
-    get_sequence_log_probs': (Ncases x beam_width)
+    references: (N_cases x 1 x max_ref_length)
+    hypotheses: (N_cases x beam_width x max_hyp_length)
+    get_sequence_log_probs': (N_cases x beam_width)
 
     For a categorical distribution, the natural params are (possibly
     unnormalized) log probabilities.  (I believe that the tensor2tensor
@@ -423,9 +423,9 @@ def tf_expected_word_error_rates(
     '''
 
     # Ns
-    Ncases = common_layers.shape_list(references)[0]
+    N_cases = common_layers.shape_list(references)[0]
     beam_width = common_layers.shape_list(hypotheses)[1]
-    N_sentences = Ncases*beam_width
+    N_sentences = N_cases*beam_width
 
     # tile references to have the same shape as hypotheses
     references = tf.reshape(
@@ -644,12 +644,12 @@ def seq_log_probs_to_word_log_probs(
     decrease the in-beam probabilities by the probability assigned to out-of-
     beam ids, the result of logsumexp will be *unnormalized* log probabilities.
     These values are furthermore desequenced into shape
-        (sum_i^Ncases targ_seq_len(i) x Nclasses)
+        (sum_i^N_cases targ_seq_len(i) x Nclasses)
     before returning.
     '''
 
     # one-hotify and scale by log probabilities
-    #   -> (Ncases x beam_width x max_pred_length x Nclasses)
+    #   -> (N_cases x beam_width x max_pred_length x Nclasses)
     # NB that the resulting tensor does *not* represent log probs, b/c it has
     #  *zeros* in the out-of-beam locations
     in_beam_log_probs = tf.multiply(
@@ -658,7 +658,7 @@ def seq_log_probs_to_word_log_probs(
     )
 
     # pad out to max_hyp_length
-    #   -> (Ncases x beam_width x max_hyp_length x Nclasses)
+    #   -> (N_cases x beam_width x max_hyp_length x Nclasses)
     max_pred_length = common_layers.shape_list(get_beam_outputs)[2]
     in_beam_log_probs = tf.pad(
         tensor=in_beam_log_probs,
@@ -688,10 +688,10 @@ def seq_log_probs_to_word_log_probs(
         IS_OUT_OF_BEAM, out_beam_log_probs, in_beam_log_probs
     )
 
-    # collapse across beam -> (Ncases x max_hyp_length x Nclasses)
+    # collapse across beam -> (N_cases x max_hyp_length x Nclasses)
     score_as_unnorm_log_probs = tf.reduce_logsumexp(beam_log_probs, axis=1)
 
-    # de-sequence -> (sum_i^Ncases targ_seq_len(i) x Nclasses)
+    # de-sequence -> (sum_i^N_cases targ_seq_len(i) x Nclasses)
     score_as_unnorm_log_probs = tf.gather_nd(
         score_as_unnorm_log_probs, index_sequences_elements
     )
@@ -711,12 +711,12 @@ def fake_beam_for_sequence_targets(
     Returns:
     --------
     references:
-        (Ncases x 1 x max_ref_length) tensor of "reference" sentences
+        (N_cases x 1 x max_ref_length) tensor of "reference" sentences
     hypotheses:
-        (Ncases x beam_width x max_hyp_length)
-        int32 tensor of size (Ncases)
+        (N_cases x beam_width x max_hyp_length)
+        int32 tensor of size (N_cases)
     fake_beam_natural_params:
-        (Ncases x beam_width)
+        (N_cases x beam_width)
 
 
     ####
@@ -785,7 +785,7 @@ def tf_sentence_to_word_ids(
         sentence_ids, unique_targets_tensor, unique_tokens_tensor, pad_token):
     '''
     (1) Given sentence *target* ids, extract the corresponding sentences
-    (2) Then break these into words (Ncases, max_len, 1)
+    (2) Then break these into words (N_cases, max_len, 1)
     (3) Convert from words to *token* ids, by broadcasting tf.equals.  The
         resulting matrix will have the word ID in its third column, and its
         location (sentence number, word number) in the first two columns
@@ -793,13 +793,13 @@ def tf_sentence_to_word_ids(
     '''
 
     extract_sentences = tf.gather(unique_targets_tensor, sentence_ids)
-    Ncases = tf.size(extract_sentences)
+    N_cases = tf.size(extract_sentences)
     extract_words = tf.expand_dims(tf.sparse.to_dense(tf.compat.v1.string_split(
         tf.reshape(extract_sentences, [-1])), default_value=pad_token), -1)
     id_tokens = tf.compat.v1.where(tf.equal(unique_tokens_tensor, extract_words))
     return tf.scatter_nd(
         id_tokens[:, 0:2], id_tokens[:, 2],
-        [tf.cast(Ncases, tf.int64), 1+tf.reduce_max(input_tensor=id_tokens[:, 1])])
+        [tf.cast(N_cases, tf.int64), 1+tf.reduce_max(input_tensor=id_tokens[:, 1])])
 
 
 def average_gradients(tower_grads):

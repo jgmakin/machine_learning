@@ -53,13 +53,13 @@ Created: November 2023
 
 '''
 Data orderings:
-    canonical:          (batch_size x T x N_features)
-    Conv1d:             (batch_size x N_features x T)
+    canonical:          (N_cases x T x N_features)
+    Conv1d:             (N_cases x N_features x T)
     Embedding input:    (*)
     Embedding output:   (*, N_features)
-    RNN inputs:         (T x batch_size x N_features)    
-    RNN outputs:        (T x batch_size x N_features)
-    RNN states:         (N_layers*N_directions x batch_size x N_features)
+    RNN inputs:         (T x N_cases x N_features)    
+    RNN outputs:        (T x N_cases x N_features)
+    RNN states:         (N_layers*N_directions x N_cases x N_features)
 '''
 
 
@@ -80,12 +80,19 @@ class Sequence2Sequence(nn.Module):
         training_GPUs=None,
         EOS_token='<EOS>',
         pad_token='<pad>',
+        TARGETS_ARE_SEQUENCES=True,
         max_hyp_length=20,
-        coupling='final_state',
+        # coupling='final_state',
+        decoder_type='final_state_coupled',
         RNN_type='LSTM',
         VERBOSE=True,
     ):
         super().__init__()
+
+        if not TARGETS_ARE_SEQUENCES:
+            assert decoder_type == 'classifier', (
+                "A classifier is required for non-sequence targets!"
+            )
 
         # useful subnet_params
         #-------#
@@ -104,7 +111,7 @@ class Sequence2Sequence(nn.Module):
         # ENCODER
         self.encoder = EncoderRNN(
             self.layer_sizes, self.FF_dropout, self.RNN_dropout, subnets_params,
-            ENCODER_RNN_IS_BIDIRECTIONAL, RNN_type, coupling=coupling,
+            ENCODER_RNN_IS_BIDIRECTIONAL, RNN_type, decoder_type=decoder_type,
             VERBOSE=VERBOSE
         )
 
@@ -119,21 +126,32 @@ class Sequence2Sequence(nn.Module):
         )
 
         # DECODER
-        self.vprint('COUPLING ENCODER TO DECODER WITH ', end='')
-        match coupling:
-            case 'final_state':
-                Decoder = DecoderRNN
-                self.vprint('FINAL HIDDEN STATE')
-            case 'attention':
-                Decoder = DecoderAttentionRNN
-                self.vprint('ATTENTION')
+        self.vprint('COUPLING ENCODER ', end='')
+        match decoder_type:
+            case 'final_state_coupled':
+                self.decoder = DecoderRNN(
+                    self.layer_sizes, self.FF_dropout, self.RNN_dropout,
+                    subnets_params, 
+                    self.EOS_id,  # use EOS as SOS, as in the TF1 version
+                    max_hyp_length, RNN_type
+                )
+                self.vprint('VIA FINAL HIDDEN STATE TO DECODER')
+            case 'attention_coupled':
+                self.decoder = DecoderAttentionRNN(
+                    self.layer_sizes, self.FF_dropout, self.RNN_dropout,
+                    subnets_params, 
+                    self.EOS_id,  # use EOS as SOS, as in the TF1 version
+                    max_hyp_length, RNN_type
+                )
+                self.vprint('VIA ATTENTION TO DECODER')
+            case 'classifier':
+                self.decoder = FinalStateClassifier(
+                    self.layer_sizes, self.FF_dropout, subnets_params,
+                    ENCODER_RNN_IS_BIDIRECTIONAL
+                )
+                self.vprint('TO A FINAL-STATE CLASSIFIER')
             case _:
                 raise ValueError('Unrecognized decoder_type')
-        self.decoder = Decoder(
-            self.layer_sizes, self.FF_dropout, self.RNN_dropout, subnets_params,
-            self.EOS_id,  # use EOS as SOS, as in the TF1 version
-            max_hyp_length, RNN_type
-        )
 
         # accumulate the loss functions over subjects and their losses
         self.loss_fxn_dicts = {}
@@ -152,15 +170,15 @@ class Sequence2Sequence(nn.Module):
         '''
         The inputs, targets, and natural_params have JGM "canonical ordering,"
 
-            (batch_size x T x N_features) and (batch_size x T)
+            (N_cases x T x N_features) and (N_cases x T)
 
         The RNN outputs have RNN ordering,
 
-            (T x batch_size x N_features)
+            (T x N_cases x N_features)
 
         and the RNN states ("similarly") have shape
 
-            (N_layers*N_directions x batch_size x N_features)
+            (N_layers*N_directions x N_cases x N_features)
         '''
 
         # for storing useful outputs
@@ -178,8 +196,8 @@ class Sequence2Sequence(nn.Module):
         else:
             context = self.reshape_context(encoder_final_states)
         self.decoder(
-            encoder_rnn_outputs, context, targets, 
-            natural_params_dict, image_dict,
+            encoder_rnn_outputs, context, targets, natural_params_dict,
+            image_dict,
         )
 
         return natural_params_dict, image_dict
@@ -240,7 +258,7 @@ class EncoderRNN(nn.Module):
         subnets_params,
         BIDIRECTIONAL,
         RNN_type,
-        coupling=None,
+        decoder_type=None,
         MAX_POOL=False,
         VERBOSE=True,
     ):
@@ -254,7 +272,7 @@ class EncoderRNN(nn.Module):
 
         self.FF_dropout = FF_dropout
         self.RNN_dropout = RNN_dropout
-        self.coupling = coupling
+        self.decoder_type = decoder_type
 
         # accumulate proprietary components (embeddings, projections)
         self.embeddings = nn.ModuleDict()
@@ -288,7 +306,7 @@ class EncoderRNN(nn.Module):
                     )
 
                     # accumulate this encoder projection
-                    self.projections[subnet_id][key] = RNNProjection(
+                    self.projections[subnet_id][key] = MultiLayerProjection(
                         N_inputs, Ns_hidden, N_outputs, self.FF_dropout,
                         input_list_index=output_layer,
                     )
@@ -319,7 +337,7 @@ class EncoderRNN(nn.Module):
         )
 
         # reverse? (a la Sutskever 2014); canonical ordering -> RNN ordering
-        if self.coupling == 'final_state':
+        if self.decoder_type == 'final_state_coupled':
             X = reverse_sequences(X, inputs_indices, inputs_lengths)
         X = X.permute(1, 0, 2)
         
@@ -329,7 +347,7 @@ class EncoderRNN(nn.Module):
             inplace=True
         )
 
-        # put into RNN ordering (T x batch_size x N_features) and "pack"
+        # put into RNN ordering (T x N_cases x N_features) and "pack"
         X = nn.utils.rnn.pack_padded_sequence(
             X, inputs_lengths.to('cpu'), enforce_sorted=False
         )
@@ -367,6 +385,53 @@ class EncoderRNN(nn.Module):
             natural_params_dict[key] = projection(all_outputs).permute(1, 0, 2)
 
         return all_outputs, all_final_states
+
+
+class FinalStateClassifier(nn.Module):
+    def __init__(
+        self,
+        layer_sizes,
+        FF_dropout,
+        subnets_params,
+        ENCODER_RNN_IS_BIDIRECTIONAL
+    ):
+        super().__init__()
+
+        #-------#
+        # for now, assume that the decoder has no proprietary layers
+        N_outputs = subnets_params[-1].data_manifests['decoder_targets'].num_features
+        #-------#
+
+        # add a "projection"
+        self.classifier_head = MultiLayerProjection(
+            layer_sizes['encoder_rnn'][-1]*(1 + ENCODER_RNN_IS_BIDIRECTIONAL),
+            layer_sizes['decoder_projection'],
+            N_outputs, FF_dropout,
+        )
+
+    def forward(
+        self, encoder_rnn_outputs, encoder_final_states, targets,
+        natural_params_dict, image_dict
+    ):
+        '''
+        encoder_rnn_outputs aren't necessary but are included here for
+        consistency with DecoderAttentionRNN
+        '''
+
+        # use only hidden states, not cell states
+        if isinstance(encoder_final_states, tuple):
+            # LSTM
+            hidden_states = encoder_final_states[0]
+        else:
+            hidden_states = encoder_final_states
+
+        # "project" (expects a *list*) and expand to length-1 sequence
+        natural_params_dict['decoder_targets'] = self.classifier_head(
+            hidden_states)[:, None, :]
+
+        ##############
+        # targets, image_dict
+        ##############
 
 
 class DecoderRNN(nn.Module):
@@ -419,7 +484,7 @@ class DecoderRNN(nn.Module):
         ############
 
         # add a "projection"
-        self.decoder_projection = RNNProjection(
+        self.decoder_projection = MultiLayerProjection(
             layer_sizes['decoder_rnn'][-1], layer_sizes['decoder_projection'],
             N_outputs, self.FF_dropout,
         )
@@ -438,10 +503,10 @@ class DecoderRNN(nn.Module):
             # testing: use most probable prev. word as input; go one step at a time
 
             # encoder_rnn_outputs are in RNN ordering
-            batch_size = encoder_rnn_outputs[-1].shape[1]
+            N_cases = encoder_rnn_outputs[-1].shape[1]
 
-            # and the input to the embedding must have size (batch_size x 1)
-            inputs = torch.full([batch_size, 1], self.SOS_id).to(
+            # and the input to the embedding must have size (N_cases x 1)
+            inputs = torch.full([N_cases, 1], self.SOS_id).to(
                 encoder_rnn_outputs[-1].device
             )
             
@@ -464,7 +529,7 @@ class DecoderRNN(nn.Module):
             X[:, 0] = self.SOS_id
             natural_params, final_states = self.forward_core(X, encoder_final_states)
 
-        # also return None for compatibility with DecoderAttentionRNN
+        # update the natural_params_dict
         natural_params_dict['decoder_targets'] = natural_params
 
     def forward_core(self, inputs, initial_state):
@@ -524,16 +589,16 @@ class DecoderAttentionRNN(DecoderRNN):
     ):
 
         # encoder_rnn_outputs are in RNN ordering
-        batch_size = encoder_rnn_outputs[-1].shape[1]
+        N_cases = encoder_rnn_outputs[-1].shape[1]
         iMax = targets.shape[1] if targets is not None else self.max_hyp_length
             
         # The decoder will compute attention for the outputs at layer l using
         #  the states at layer l.  Here we collect the outputs into a tensor of
-        #  size (N_layers x T x batch_size x N_features)
+        #  size (N_layers x T x N_cases x N_features)
         encoder_outputs = torch.stack(encoder_rnn_outputs[-self.RNN.num_layers:])
         
-        # and the input to the embedding must have size (batch_size x 1)
-        inputs = torch.full([batch_size, 1], self.SOS_id).to(
+        # and the input to the embedding must have size (N_cases x 1)
+        inputs = torch.full([N_cases, 1], self.SOS_id).to(
             encoder_outputs.device
         )
         states = encoder_final_states
@@ -555,12 +620,12 @@ class DecoderAttentionRNN(DecoderRNN):
                 # training: use *actual* previous word as input
                 inputs = targets[:, i, None]
 
-        # (batch_size x T_out x N_out)
+        # (N_cases x T_out x N_out)
         natural_params_dict['decoder_targets'] = torch.cat(natural_params, dim=1)
         
         # just for plotting
         if not self.training:
-            # (N_layers x Te x batch_size x Td) -> (batch_size x N_layers x Td x Te)
+            # (N_layers x Te x N_cases x Td) -> (N_cases x N_layers x Td x Te)
             attn_weights = torch.cat(attn_weights, dim=3).permute([2, 0, 3, 1])
             # attn_weights /= attn_weights.amax(dim=(2, 3), keepdim=True)
             attn_weights /= attn_weights.amax(dim=(2), keepdim=True)
@@ -574,9 +639,9 @@ class DecoderAttentionRNN(DecoderRNN):
 
     def forward_step(self, inputs, states, encoder_outputs):
         ''' 
-        inputs:             (batch_size x 1)
-        states:             (N_layers x batch_size x N_hidden_RNN)
-        encoder_outputs:    (N_layers x T x batch_size x N_out_encoder_RNN)
+        inputs:             (N_cases x 1)
+        states:             (N_layers x N_cases x N_hidden_RNN)
+        encoder_outputs:    (N_layers x T x N_cases x N_out_encoder_RNN)
         '''
 
         # get attention weights
@@ -587,7 +652,7 @@ class DecoderAttentionRNN(DecoderRNN):
             queries = states[:, None, :, :]
         context, attn_weights = self.attention(queries, encoder_outputs)
 
-        # embed inputs---into size (batch_size x 1 x M)
+        # embed inputs---into size (N_cases x 1 x M)
         X = self.embedding(inputs)
         
         # concatenate "context" onto embedded input
@@ -625,29 +690,29 @@ class BahdanauAttention(nn.Module):
 
     def forward(self, queries, keys):
         '''
-        queries:    (N_layers x 1 x batch_size x query_length)
-        keys:       (N_layers x T x batch_size x key_length)
+        queries:    (N_layers x 1 x N_cases x query_length)
+        keys:       (N_layers x T x N_cases x key_length)
 
-        context:    (batch_size x key_length)
-        weights:    (N_layers x T x batch_size x 1)
+        context:    (N_cases x key_length)
+        weights:    (N_layers x T x N_cases x 1)
         '''
 
-        # a tensor of size (N_layers x T x batch_size x 1)
+        # a tensor of size (N_layers x T x N_cases x 1)
         scores = torch.stack([
             V(torch.tanh(Q(query) + K(key))) for V, Q, K, query, key in zip(
                 self.V_list, self.Q_list, self.K_list, queries, keys
             )
         ])
         
-        # -> (N_layers*T x batch_size) to normalize over *both* layers and time
-        batch_size = scores.shape[2]
-        scores = scores.reshape([-1, batch_size])
+        # -> (N_layers*T x N_cases) to normalize over *both* layers and time
+        N_cases = scores.shape[2]
+        scores = scores.reshape([-1, N_cases])
 
         # normalize and compute convex combination of keys
         weights = F.softmax(scores, dim=0)
-        weights = weights.reshape([self.N_layers, -1, batch_size, 1])
+        weights = weights.reshape([self.N_layers, -1, N_cases, 1])
 
-        # sum across N_layers, T -> (batch_size x key_length)
+        # sum across N_layers, T -> (N_cases x key_length)
         context = torch.sum(weights*keys, dim=(0, 1))
         
         # we return the attention weights only for plotting purposes
@@ -728,7 +793,7 @@ class MLConvEmbedding(nn.Module):
 
     def forward(self, inputs):
 
-        # canonical ordering -> conv ordering, (batch_size x N_features x T)
+        # canonical ordering -> conv ordering, (N_cases x N_features x T)
         X = inputs.permute(0, 2, 1)
 
         # In 'VALID'-style convolution, the data are not padded to accommodate
@@ -749,7 +814,7 @@ class MLConvEmbedding(nn.Module):
         return X.permute(0, 2, 1)
 
 
-class RNNProjection(nn.Module):
+class MultiLayerProjection(nn.Module):
     def __init__(
         self,
         N_inputs,
@@ -789,7 +854,7 @@ def context_reshape(states, N_layers, N_directions=2):
     '''
     Pytorch RNNs return the states with size
 
-        (N_layers*N_directions x batch_size x other).
+        (N_layers*N_directions x N_cases x other).
 
     Thus, the two different directions of a bidirectional RNN are concatenated
     together along the *layers* dimension.  Now, to initialize a unidirectional
@@ -797,7 +862,7 @@ def context_reshape(states, N_layers, N_directions=2):
     N_features, we need to unpack the first dimension, permute, and then
     flatten again:
 
-        (N_layers x batch_size x N_directions*N_features)
+        (N_layers x N_cases x N_directions*N_features)
 
     This function will also only select the last N_layers' worth of states, and
     so can be used to hook up encoder and decoder RNNs of different depths.
@@ -809,10 +874,10 @@ def context_reshape(states, N_layers, N_directions=2):
     '''    
 
     # useful sizes
-    _, batch_size, N_features = states.shape
+    _, N_cases, N_features = states.shape
 
     # break layers and directions into separate dimensions
-    states = states.reshape([-1, N_directions, batch_size, N_features])
+    states = states.reshape([-1, N_directions, N_cases, N_features])
 
     # only grab the last N_layers' worth of states
     states = states[-N_layers:]
@@ -836,7 +901,7 @@ class SequenceTrainer():
         assessment_epoch_interval=None,
         tf_summaries_dir=None,
         #####
-        batch_size=128,
+        N_cases=128,
         assessment_op_set={
             'decoder_word_error_rate',
             'decoder_accuracy',
@@ -861,7 +926,7 @@ class SequenceTrainer():
                 else subnets_params
             )
             self.loaders[data_partition] = TFRecordDataLoader(
-                params, data_partition, batch_size
+                params, data_partition, N_cases
             )
             self.writers[data_partition] = SummaryWriter(
                 log_dir=os.path.join(self.tf_summaries_dir, data_partition)
@@ -917,7 +982,7 @@ class SequenceTrainer():
                 if coder == 'encoder':
                     d = metadata_dicts[coder]['decimation_factor']
                     targets = targets[:, ::d, :]
-                    if sequence_net.coupling == 'final_state':
+                    if sequence_net.decoder_type == 'final_state_coupled':
                         targets = reverse_sequences(targets, indices, lengths)
 
                 # accumulate loss
@@ -946,7 +1011,7 @@ class SequenceTrainer():
                     self.batch_assess(
                         batch_op_core, sequence_net, data_partition, epoch, device
                     )
-                    
+
                     # store
                     self.assessments[data_partition].decoder_word_error_rates[
                         epoch//self.assessment_epoch_interval
@@ -975,7 +1040,7 @@ class SequenceTrainer():
                 device_batch['encoder_inputs'], device_batch['subnet_id'],
                 device_batch['decoder_targets'][:, :, 0]
             )
-            
+
             # accumulate total number of examples
             N_examples += device_batch['encoder_inputs'].shape[0]
 
@@ -1036,9 +1101,12 @@ class SequenceTrainer():
 
                 # only consider the single sequence of most probable classes
                 _, most_probable_classes = natural_params_dict['decoder_targets'].topk(1)
-                most_probable_classes = terminate_sequences(
-                    most_probable_classes, net.EOS_id, net.pad_id
-                )
+                if net.TARGETS_ARE_SEQUENCES:
+                    most_probable_classes = terminate_sequences(
+                        most_probable_classes, net.EOS_id, net.pad_id
+                    )
+
+                # accumulate word error rates
                 WERs = get_word_error_rate(
                     device_batch['decoder_targets'], most_probable_classes
                 )
@@ -1071,7 +1139,7 @@ class SequenceTrainer():
                 'image_name', image, dataformats='HW',
                 # max_outputs=16
             )
-        
+
         # report WER(s)
         per_example_WER = epoch_WER/N_examples
         print(
@@ -1172,6 +1240,7 @@ def categorical_cross_entropy(natural_params, targets):
     return nn.CrossEntropyLoss(reduction='sum')(
         natural_params, targets[:, 0].to(torch.int64)
     )
+
 
 def swap(key, string):
     # In SequenceNetworks, keys are often constructed from the data_manifest
