@@ -114,7 +114,7 @@ class SplitMNIST(torchvision.datasets.MNIST):
             tuple: (image, target) where target is index of the target class
                 and image is (2 x image_height/2 x image_width)
         """
-        
+
         # apply any 
         class_id = self.targets[index]
         if self.target_transform is not None:
@@ -124,7 +124,7 @@ class SplitMNIST(torchvision.datasets.MNIST):
 
         # break into top and bottom
         # image = image.reshape(2, -1, image.shape[-1])
-            
+
         # break into left and right
         image = image.swapaxes(1, 2)
         image = image.reshape(2, -1, image.shape[-1])
@@ -146,22 +146,26 @@ class SplitMNIST(torchvision.datasets.MNIST):
 
 
 class TFRecordDataLoader:
-    def __init__(self, subnets_params, data_partition, batch_size):
+    def __init__(
+        self, subnets_params, data_partition, N_cases, OOV_token,
+        TARGETS_ARE_SEQUENCES=True,
+    ):
 
         # don't let TF allocate the GPU to itself
         tf.config.set_visible_devices([], 'GPU')
         ds = self._tf_records_to_dataset(
-            subnets_params, data_partition, batch_size,
+            subnets_params, data_partition, N_cases, OOV_token,
+            TARGETS_ARE_SEQUENCES,
             # num_shards_to_discard=0, DROP_REMAINDER=False
         )
         N_batches = 0
         for batch in ds:
             N_batches += 1
-        self.N_batches = N_batches        
+        self.N_batches = N_batches
         self.ds = tfds.as_numpy(ds)
-        # self.batch_size = batch_size
+        # self.N_cases = N_cases
         self._iterator = None
-    
+
     def __iter__(self):
         if self._iterator is None:
             self._iterator = iter(self.ds)
@@ -180,8 +184,8 @@ class TFRecordDataLoader:
         return self. N_batches
 
     def _tf_records_to_dataset(
-        self, subnets_params, data_partition, num_cases,
-        num_shards_to_discard=0, DROP_REMAINDER=False
+        self, subnets_params, data_partition, num_cases, OOV_token,
+        TARGETS_ARE_SEQUENCES, num_shards_to_discard=0, DROP_REMAINDER=False,
     ):
         '''
         Load, shuffle, batch and pad, and concatentate across subnets (for
@@ -201,7 +205,7 @@ class TFRecordDataLoader:
                 ),
                 num_parallel_calls=tf.data.AUTOTUNE
             )
-            
+
             # filter data to include or exclude only specified decoder targets?
             decoder_targets_list = subnet_params.data_manifests[
                 'decoder_targets'].get_feature_list()
@@ -211,18 +215,17 @@ class TFRecordDataLoader:
             )
             dataset = target_filter.filter_dataset(dataset)
 
-            # # filter out words not in the decoder_targets_list
-            # ######
-            # # FIX ME
-            # if True:  # not self.TARGETS_ARE_SEQUENCES:
-            #     OOV_id = (
-            #         decoder_targets_list.index(self.OOV_token)
-            #         if self.OOV_token in decoder_targets_list else -1
-            #     )
-            #     dataset = dataset.filter(
-            #         lambda encoder_input, decoder_target, encoder_target, s_id:
-            #             tf.not_equal(decoder_target[0], OOV_id))
-            # # ######
+            # filter out words not in the decoder_targets_list
+            if not TARGETS_ARE_SEQUENCES:
+                # ...then get rid of OOV examples
+                OOV_id = (
+                    decoder_targets_list.index(OOV_token)
+                    if OOV_token in decoder_targets_list else -1
+                )
+                # NB that x['decoder_targets'].shape = [None, 1]
+                dataset = dataset.filter(
+                    lambda x: tf.not_equal(x['decoder_targets'][0, 0], OOV_id)
+                )
 
             # discard some of the data?; shuffle; batch (evening out w/padding)
             if num_shards_to_discard > 0:
@@ -393,7 +396,7 @@ class TargetFilter:
 #             (T_i x N_features).
 #         where T_i is the length of that particular example.  The elements of
 #         the output, batch_dict, have size
-#             (batch_size x T x N_features),
+#             (N_cases x T x N_features),
 #         where T is the length of the longest sequence in the batch.
 #         '''
 

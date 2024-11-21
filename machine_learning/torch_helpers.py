@@ -120,7 +120,7 @@ def get_word_error_rate(
     """
 
     # ...
-    device = references.get_device()
+    device = references.device
     N_sentences = references.shape[0]
     if hypotheses.shape[0] != N_sentences:
         raise ValueError('no. of hypotheses must equal no. of references')

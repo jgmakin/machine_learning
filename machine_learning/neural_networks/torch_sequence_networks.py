@@ -901,6 +901,7 @@ class SequenceTrainer():
         assessment_epoch_interval=None,
         tf_summaries_dir=None,
         #####
+        OOV_token='<OOV>',
         N_cases=128,
         assessment_op_set={
             'decoder_word_error_rate',
@@ -908,6 +909,7 @@ class SequenceTrainer():
             'loss'
         },
         REPORT_TRAINING_LOSS=True,
+        TARGETS_ARE_SEQUENCES=True,
     ):
 
         class AssessmentTuple(MutableNamedTuple):
@@ -926,7 +928,7 @@ class SequenceTrainer():
                 else subnets_params
             )
             self.loaders[data_partition] = TFRecordDataLoader(
-                params, data_partition, N_cases
+                params, data_partition, N_cases, OOV_token, TARGETS_ARE_SEQUENCES,
             )
             self.writers[data_partition] = SummaryWriter(
                 log_dir=os.path.join(self.tf_summaries_dir, data_partition)
@@ -1175,7 +1177,7 @@ def penalize_RNN(
     if CE_key not in epoch_loss_dict:
         epoch_loss_dict[CE_key] = 0
     epoch_loss_dict[CE_key] += loss.item()
-    
+
     return penalty_scale*loss
 
 
