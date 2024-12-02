@@ -73,25 +73,25 @@ class Sequence2Sequence(nn.Module):
         # kwargs set in the manifest
         layer_sizes=None,
         FF_dropout=None,
-        RNN_dropout=None,
-        TEMPORALLY_CONVOLVE=None,  ### currently does nothing
+        RNN_dropout=None,           # misnomer
+        TEMPORALLY_CONVOLVE=None,   # !! currently does nothing
         #####
-        ENCODER_RNN_IS_BIDIRECTIONAL=True,
+        ENCODER_IS_BIDIRECTIONAL=True,
         training_GPUs=None,
         EOS_token='<EOS>',
         pad_token='<pad>',
         TARGETS_ARE_SEQUENCES=True,
         max_hyp_length=20,
-        # coupling='final_state',
-        decoder_type='final_state_coupled',
-        RNN_type='LSTM',
+        coupling='attention',       # 'final state'
+        encoder_type='GRU',
+        decoder_type='GRU',
         VERBOSE=True,
     ):
         super().__init__()
 
-        if not TARGETS_ARE_SEQUENCES:
-            assert decoder_type == 'classifier', (
-                "A classifier is required for non-sequence targets!"
+        if decoder_type == 'classifier':
+            assert not TARGETS_ARE_SEQUENCES, (
+                "Non-sequence targets require the decoder to be a classifier!"
             )
 
         # useful subnet_params
@@ -106,52 +106,61 @@ class Sequence2Sequence(nn.Module):
         self.EOS_id = self.decoder_targets_list.index(self.EOS_token)
         self.pad_id = self.decoder_targets_list.index(self.pad_token)
 
-        self.vprint('USING %s IN THE RNNs' % RNN_type)
+        self.vprint('COUPLING %s ENCODER TO %s DECODER WITH %s' % (
+            encoder_type, decoder_type, coupling
+        ))
 
         # ENCODER
-        self.encoder = EncoderRNN(
-            self.layer_sizes, self.FF_dropout, self.RNN_dropout, subnets_params,
-            ENCODER_RNN_IS_BIDIRECTIONAL, RNN_type, decoder_type=decoder_type,
-            VERBOSE=VERBOSE
-        )
+        match encoder_type:
+            case 'LSTM' | 'GRU':
+                self.encoder = EncoderRNN(
+                    self.layer_sizes, self.FF_dropout, self.RNN_dropout,
+                    subnets_params, self.ENCODER_IS_BIDIRECTIONAL,
+                    encoder_type, coupling=coupling, VERBOSE=VERBOSE
+                )
+            case 'transformer':
+                self.encoder = EncoderTransformer(
+                    self.layer_sizes, self.FF_dropout, self.RNN_dropout,
+                    subnets_params, coupling=coupling, VERBOSE=VERBOSE
+                )
+                self.ENCODER_IS_BIDIRECTIONAL = False
+            case _: 
+                raise ValueError('Unrecognized decoder_type')
 
         # reshape the context to pass to the decoder
-        # self.reshape_context = lambda states: context_reshape(
-        #     states, len(self.layer_sizes['decoder_rnn']),
-        #     ENCODER_RNN_IS_BIDIRECTIONAL+1
-        # )
         self.reshape_context = partial(
             context_reshape,  N_layers=len(self.layer_sizes['decoder_rnn']),
-            N_directions=ENCODER_RNN_IS_BIDIRECTIONAL+1
+            N_directions=self.ENCODER_IS_BIDIRECTIONAL+1
         )
 
         # DECODER
         self.vprint('COUPLING ENCODER ', end='')
-        match decoder_type:
-            case 'final_state_coupled':
-                self.decoder = DecoderRNN(
-                    self.layer_sizes, self.FF_dropout, self.RNN_dropout,
-                    subnets_params, 
-                    self.EOS_id,  # use EOS as SOS, as in the TF1 version
-                    max_hyp_length, RNN_type
-                )
-                self.vprint('VIA FINAL HIDDEN STATE TO DECODER')
-            case 'attention_coupled':
-                self.decoder = DecoderAttentionRNN(
-                    self.layer_sizes, self.FF_dropout, self.RNN_dropout,
-                    subnets_params, 
-                    self.EOS_id,  # use EOS as SOS, as in the TF1 version
-                    max_hyp_length, RNN_type
-                )
-                self.vprint('VIA ATTENTION TO DECODER')
-            case 'classifier':
-                self.decoder = FinalStateClassifier(
-                    self.layer_sizes, self.FF_dropout, subnets_params,
-                    ENCODER_RNN_IS_BIDIRECTIONAL
-                )
-                self.vprint('TO A FINAL-STATE CLASSIFIER')
-            case _:
-                raise ValueError('Unrecognized decoder_type')
+        if decoder_type == 'classifier':
+            self.decoder = FinalStateClassifier(
+                self.layer_sizes, self.FF_dropout, subnets_params,
+                self.ENCODER_IS_BIDIRECTIONAL
+            )
+            self.vprint('TO A FINAL-STATE CLASSIFIER')
+        else:
+            match coupling:
+                case 'final state':
+                    self.decoder = DecoderRNN(
+                        self.layer_sizes, self.FF_dropout, self.RNN_dropout,
+                        subnets_params, self.EOS_id, max_hyp_length,
+                        # use EOS as SOS, as in the TF1 version
+                        decoder_type
+                    )
+                    self.vprint('VIA FINAL HIDDEN STATE TO DECODER')
+                case 'attention':
+                    self.decoder = DecoderAttentionRNN(
+                        self.layer_sizes, self.FF_dropout, self.RNN_dropout,
+                        subnets_params, self.EOS_id, max_hyp_length,
+                        # use EOS as SOS, as in the TF1 version
+                        decoder_type
+                    )
+                    self.vprint('VIA ATTENTION TO DECODER')
+                case _:
+                    raise ValueError('Unrecognized decoder_type')
 
         # accumulate the loss functions over subjects and their losses
         self.loss_fxn_dicts = {}
@@ -258,7 +267,7 @@ class EncoderRNN(nn.Module):
         subnets_params,
         BIDIRECTIONAL,
         RNN_type,
-        decoder_type=None,
+        coupling=None,
         MAX_POOL=False,
         VERBOSE=True,
     ):
@@ -272,7 +281,7 @@ class EncoderRNN(nn.Module):
 
         self.FF_dropout = FF_dropout
         self.RNN_dropout = RNN_dropout
-        self.decoder_type = decoder_type
+        self.coupling = coupling
 
         # accumulate proprietary components (embeddings, projections)
         self.embeddings = nn.ModuleDict()
@@ -336,8 +345,9 @@ class EncoderRNN(nn.Module):
             inputs[:, ::self.decimation_factors[subnet_id], :]
         )
 
-        # reverse? (a la Sutskever 2014); canonical ordering -> RNN ordering
-        if self.decoder_type == 'final_state_coupled':
+        # reverse? (a la Sutskever 2014); canonical ordering -> RNN ordering,
+        #  (T x N_cases x N_features)
+        if self.coupling == 'final_state':
             X = reverse_sequences(X, inputs_indices, inputs_lengths)
         X = X.permute(1, 0, 2)
         
@@ -347,7 +357,7 @@ class EncoderRNN(nn.Module):
             inplace=True
         )
 
-        # put into RNN ordering (T x N_cases x N_features) and "pack"
+        # "pack" and pad
         X = nn.utils.rnn.pack_padded_sequence(
             X, inputs_lengths.to('cpu'), enforce_sorted=False
         )
@@ -387,13 +397,132 @@ class EncoderRNN(nn.Module):
         return all_outputs, all_final_states
 
 
+class EncoderTransformer(nn.Module):
+    def __init__(
+        self,
+        layer_sizes,
+        FF_dropout, 
+        T_dropout,
+        subnets_params,
+        coupling=None,
+        MAX_POOL=False,
+        VERBOSE=True,
+    ):
+        super().__init__()
+
+        # ...
+        if len(np.unique(layer_sizes['encoder_rnn'])) > 1:
+            raise NotImplementedError('Expected the same layer size for all layers')
+        else:
+            N_hidden = layer_sizes['encoder_rnn'][0]
+
+        self.FF_dropout = FF_dropout
+        self.T_dropout = T_dropout
+        self.coupling = coupling
+
+        # accumulate proprietary components (embeddings, projections)
+        self.embeddings = nn.ModuleDict()
+        self.projections = nn.ModuleDict()
+        self.decimation_factors = {}
+        for subnet_params in subnets_params:
+            subnet_id = str(subnet_params.subnet_id)
+
+            # embedding_layers
+            self.embeddings[subnet_id] = MLConvEmbedding(
+                subnet_params.data_manifests['encoder_inputs'].num_features,
+                layer_sizes['encoder_embedding'], subnet_params,
+                self.FF_dropout, MAX_POOL, VERBOSE=VERBOSE
+            )
+
+            # decimation_factors
+            self.decimation_factors[subnet_id] = subnet_params.decimation_factor
+
+            # penalize phonemes, etc.???
+            # projections
+            # self.projections[subnet_id] = nn.ModuleDict()
+            # for key in subnet_params.data_mapping:
+            #     if key.startswith('encoder') and key.endswith('targets'):
+
+            #         # useful quantities
+            #         data_manifest = subnet_params.data_manifests[key]
+            #         output_layer = int(key.split('_')[1])
+            #         N_outputs = data_manifest.num_features
+            #         Ns_hidden = layer_sizes['encoder_%i_projection' % output_layer]
+            #         N_inputs = layer_sizes['encoder_rnn'][output_layer]*(
+            #             BIDIRECTIONAL + 1
+            #         )
+
+            #         # accumulate this encoder projection
+            #         self.projections[subnet_id][key] = MultiLayerProjection(
+            #             N_inputs, Ns_hidden, N_outputs, self.FF_dropout,
+            #             input_list_index=output_layer,
+            #         )
+
+        # from conv output dim to transformer input dim
+        self.pretransformer = nn.Linear(
+            layer_sizes['encoder_embedding'][-1], N_hidden
+        )
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=N_hidden, nhead=2, dim_feedforward=N_hidden,
+            dropout=self.T_dropout
+        )
+        self.transformer_encoder = nn.TransformerEncoder(
+            encoder_layer=encoder_layer,
+            num_layers=len(layer_sizes['encoder_rnn']),
+        )
+        
+        ###############
+        # flatten_parameters()
+        ###############
+
+    def forward(self, inputs, subnet_id, natural_params_dict, image_dict):
+
+        # embed with temporal convolutions
+        X = self.embeddings[subnet_id](inputs)
+
+        # get lengths of *downsampled* input sequences
+        inputs_indices, inputs_lengths = sequences_tools(
+            inputs[:, ::self.decimation_factors[subnet_id], :]
+        )
+
+        # reverse? (a la Sutskever 2014); canonical ordering -> transformer
+        #   ordering, (T x N_cases x N_features)
+        if self.coupling == 'final_state':
+            X = reverse_sequences(X, inputs_indices, inputs_lengths)
+        X = X.permute(1, 0, 2)
+        
+        # pad
+        # X = nn.utils.rnn.pack_padded_sequence(
+        #     X, inputs_lengths.to('cpu'), enforce_sorted=False
+        # )
+
+        # the original TF version used dropout on the RNN *inputs*
+        X = self.pretransformer(X)
+        X = F.dropout(
+            X, self.FF_dropout, training=self.training, inplace=True
+        )
+
+        # transform
+        X = self.transformer_encoder(X)
+
+        # # "project" into natural params and convert back to canonical ordering
+        # for key, projection in self.projections[subnet_id].items():
+        #     natural_params_dict[key] = projection(X).permute(1, 0, 2)
+
+        # return only the mean across time?
+        # states = torch.mean(X, 0, keepdim=True)
+        states = X[-1:]
+
+        return None, states
+
+
 class FinalStateClassifier(nn.Module):
     def __init__(
         self,
         layer_sizes,
         FF_dropout,
         subnets_params,
-        ENCODER_RNN_IS_BIDIRECTIONAL
+        ENCODER_IS_BIDIRECTIONAL
     ):
         super().__init__()
 
@@ -404,7 +533,7 @@ class FinalStateClassifier(nn.Module):
 
         # add a "projection"
         self.classifier_head = MultiLayerProjection(
-            layer_sizes['encoder_rnn'][-1]*(1 + ENCODER_RNN_IS_BIDIRECTIONAL),
+            layer_sizes['encoder_rnn'][-1]*(1 + ENCODER_IS_BIDIRECTIONAL),
             layer_sizes['decoder_projection'],
             N_outputs, FF_dropout,
         )
@@ -984,7 +1113,7 @@ class SequenceTrainer():
                 if coder == 'encoder':
                     d = metadata_dicts[coder]['decimation_factor']
                     targets = targets[:, ::d, :]
-                    if sequence_net.decoder_type == 'final_state_coupled':
+                    if sequence_net.coupling == 'final_state':
                         targets = reverse_sequences(targets, indices, lengths)
 
                 # accumulate loss
