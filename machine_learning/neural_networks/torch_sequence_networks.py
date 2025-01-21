@@ -468,18 +468,18 @@ class EncoderTransformer(nn.Module):
                         N_inputs, Ns_hidden, N_outputs, self.FF_dropout,
                     )
 
-        # position encodings
-        ####
-        # max sentence length = (~20 samples/sec)(6.25 sec) \approx 128
-        self.positional_encoding = RotaryPositionalEmbeddings(
-            # N_hidden//self.N_head, 128
-            N_hidden, 128
-        )
-        ####
-
         # from conv output dim to transformer input dim
         self.pretransformer = nn.Linear(
             layer_sizes['encoder_embedding'][-1], N_hidden
+        )
+        # position encodings
+        # max sentence length = (~20 samples/sec)(6.25 sec) \approx 128
+        # self.positional_encoding = RotaryPositionalEmbeddings(
+        #     # N_hidden//self.N_head, 128
+        #     N_hidden, 128
+        # )
+        self.positional_encoding = PositionalEncoding(
+            d_model=N_hidden, dropout=0, max_len=256
         )
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=N_hidden, nhead=self.N_head, dim_feedforward=N_hidden,
@@ -509,13 +509,14 @@ class EncoderTransformer(nn.Module):
             X, self.FF_dropout, training=self.training, inplace=True
         )
 
-        # add positional encodings
-        N_cases, T = X.shape[:2]
-        # X = self.positional_encoding(X.view([N_cases, T, self.N_head, -1]))
-        X = self.positional_encoding(X.unsqueeze(2)).squeeze(2)
-
         # switch out of batch-first
         X = X.permute(1, 0, 2)
+
+        # add positional encodings
+        # N_cases, T = X.shape[:2]
+        # X = self.positional_encoding(X.view([N_cases, T, self.N_head, -1]))
+        # X = self.positional_encoding(X.unsqueeze(2)).squeeze(2)
+        X = self.positional_encoding(X)
 
         # transform
         # X = self.transformer_encoder(X)
@@ -1345,6 +1346,29 @@ class SequenceTrainer():
         # fake it
         self.assessments[data_partition].decoder_accuracy = 1 - per_example_WER
         ############
+
+
+class PositionalEncoding(nn.Module):
+    # see https://stackoverflow.com/questions/77444485/
+
+    def __init__(self, d_model: int, dropout: float = 0.1, max_len: int = 5000):
+        super().__init__()
+        self.dropout = nn.Dropout(p=dropout)
+
+        position = torch.arange(max_len).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model))
+        pe = torch.zeros(max_len, 1, d_model)
+        pe[:, 0, 0::2] = torch.sin(position * div_term)
+        pe[:, 0, 1::2] = torch.cos(position * div_term)
+        self.register_buffer('pe', pe)
+
+    def forward(self, x):
+        """
+        Arguments:
+            x: Tensor, shape ``[seq_len, batch_size, embedding_dim]``
+        """
+        x = x + self.pe[:x.size(0)]
+        return self.dropout(x)
 
 
 def penalize_RNN(
