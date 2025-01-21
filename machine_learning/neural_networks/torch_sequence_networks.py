@@ -13,6 +13,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchvision
 from torch.utils.tensorboard import SummaryWriter
+from torchtune.modules import RotaryPositionalEmbeddings
 #######
 # from torch.profiler import profile, record_function, ProfilerActivity
 #######
@@ -43,7 +44,12 @@ Created: November 2023
 
 
 ###############
-# (15) batch size?
+# (1) transformer encoder:
+#   (a) for word_*sequence*
+#   (b) add positional encoding
+#
+#
+#
 # (16) NB: the penalty_scale probably means something different for MFCCs
 #   b/c you are summing rather than averaging across the 13 dimensions...
 # (17) serial transfer learning
@@ -57,9 +63,10 @@ Data orderings:
     Conv1d:             (N_cases x N_features x T)
     Embedding input:    (*)
     Embedding output:   (*, N_features)
-    RNN inputs:         (T x N_cases x N_features)    
+    RNN inputs:         (T x N_cases x N_features)
     RNN outputs:        (T x N_cases x N_features)
     RNN states:         (N_layers*N_directions x N_cases x N_features)
+    reshaped states:    (N_layers x N_cases x N_directions*N_features)
 '''
 
 
@@ -106,9 +113,9 @@ class Sequence2Sequence(nn.Module):
         self.EOS_id = self.decoder_targets_list.index(self.EOS_token)
         self.pad_id = self.decoder_targets_list.index(self.pad_token)
 
-        self.vprint('COUPLING %s ENCODER TO %s DECODER WITH %s' % (
-            encoder_type, decoder_type, coupling
-        ))
+        # self.vprint('COUPLING %s ENCODER TO %s DECODER WITH %s' % (
+        #   encoder_type, decoder_type, coupling
+        # ))
 
         # ENCODER
         match encoder_type:
@@ -134,7 +141,7 @@ class Sequence2Sequence(nn.Module):
         )
 
         # DECODER
-        self.vprint('COUPLING ENCODER ', end='')
+        self.vprint('COUPLING %s ENCODER ' % encoder_type, end='')
         if decoder_type == 'classifier':
             self.decoder = FinalStateClassifier(
                 self.layer_sizes, self.FF_dropout, subnets_params,
@@ -146,17 +153,19 @@ class Sequence2Sequence(nn.Module):
                 case 'final state':
                     self.decoder = DecoderRNN(
                         self.layer_sizes, self.FF_dropout, self.RNN_dropout,
-                        subnets_params, self.EOS_id, max_hyp_length,
+                        subnets_params, self.EOS_id, max_hyp_length, decoder_type
                         # use EOS as SOS, as in the TF1 version
-                        decoder_type
                     )
                     self.vprint('VIA FINAL HIDDEN STATE TO DECODER')
                 case 'attention':
+                    key_length = layer_sizes['encoder_rnn'][-1]*(
+                        1 + self.ENCODER_IS_BIDIRECTIONAL
+                    )
                     self.decoder = DecoderAttentionRNN(
-                        self.layer_sizes, self.FF_dropout, self.RNN_dropout,
-                        subnets_params, self.EOS_id, max_hyp_length,
+                        key_length, self.layer_sizes, self.FF_dropout,
+                        self.RNN_dropout, subnets_params, self.EOS_id,
+                        max_hyp_length, decoder_type
                         # use EOS as SOS, as in the TF1 version
-                        decoder_type
                     )
                     self.vprint('VIA ATTENTION TO DECODER')
                 case _:
@@ -195,18 +204,18 @@ class Sequence2Sequence(nn.Module):
         image_dict = {}
 
         # encode; project outputs; init decoder state; decode; project outputs
-        encoder_rnn_outputs, encoder_final_states = self.encoder(
+        encoder_rnn_outputs, encoder_final_states, inputs_lengths = self.encoder(
             inputs, subnet_id, natural_params_dict, image_dict
         )
         if isinstance(encoder_final_states, tuple):
-            context = tuple(
+            encoder_final_states = tuple(
                 self.reshape_context(states) for states in encoder_final_states
             )
         else:
-            context = self.reshape_context(encoder_final_states)
+            encoder_final_states = self.reshape_context(encoder_final_states)
         self.decoder(
-            encoder_rnn_outputs, context, targets, natural_params_dict,
-            image_dict,
+            encoder_rnn_outputs, encoder_final_states, targets, inputs_lengths,
+            natural_params_dict, image_dict,
         )
 
         return natural_params_dict, image_dict
@@ -244,7 +253,7 @@ class Sequence2Sequence(nn.Module):
                 accumulated_targets.append(target_words.split())
                 accumulated_predictions.append(predicted_words.split())
 
-            # only print 30 sentences
+            # only print N_sentences sentences
             if iExample > N_sentences:
                 break
 
@@ -262,7 +271,7 @@ class EncoderRNN(nn.Module):
     def __init__(
         self,
         layer_sizes,
-        FF_dropout, 
+        FF_dropout,
         RNN_dropout,
         subnets_params,
         BIDIRECTIONAL,
@@ -307,17 +316,16 @@ class EncoderRNN(nn.Module):
 
                     # useful quantities
                     data_manifest = subnet_params.data_manifests[key]
-                    output_layer = int(key.split('_')[1])
+                    RNN_layer = int(key.split('_')[1])
                     N_outputs = data_manifest.num_features
-                    Ns_hidden = layer_sizes['encoder_%i_projection' % output_layer]
-                    N_inputs = layer_sizes['encoder_rnn'][output_layer]*(
+                    Ns_hidden = layer_sizes['encoder_%i_projection' % RNN_layer]
+                    N_inputs = layer_sizes['encoder_rnn'][RNN_layer]*(
                         BIDIRECTIONAL + 1
                     )
 
                     # accumulate this encoder projection
                     self.projections[subnet_id][key] = MultiLayerProjection(
                         N_inputs, Ns_hidden, N_outputs, self.FF_dropout,
-                        input_list_index=output_layer,
                     )
 
         # the RNN; you may need outputs from intermediate layers, so you have
@@ -330,27 +338,27 @@ class EncoderRNN(nn.Module):
                 RNN(N_in, N_hidden, num_layers=1, bidirectional=BIDIRECTIONAL)
             )
             N_in = N_hidden*(1 + BIDIRECTIONAL)
-        
+
         ###############
         # flatten_parameters()
         ###############
 
     def forward(self, inputs, subnet_id, natural_params_dict, image_dict):
 
-        # embed with temporal convolutions
-        X = self.embeddings[subnet_id](inputs)
-
         # get lengths of *downsampled* input sequences
         inputs_indices, inputs_lengths = sequences_tools(
             inputs[:, ::self.decimation_factors[subnet_id], :]
         )
 
+        # embed with temporal convolutions
+        X = self.embeddings[subnet_id](inputs)
+
         # reverse? (a la Sutskever 2014); canonical ordering -> RNN ordering,
         #  (T x N_cases x N_features)
-        if self.coupling == 'final_state':
+        if self.coupling == 'final state':
             X = reverse_sequences(X, inputs_indices, inputs_lengths)
         X = X.permute(1, 0, 2)
-        
+
         # the original TF version used dropout on the RNN *inputs*
         X = F.dropout(
             X, self.RNN_dropout, training=self.training,
@@ -362,24 +370,25 @@ class EncoderRNN(nn.Module):
             X, inputs_lengths.to('cpu'), enforce_sorted=False
         )
 
-        # run through RNN---layer by layer, to accumulate outputs for encoder
-        #  targeting
+        # Run through RNN---layer by layer, to accumulate outputs for encoder
+        #  targeting.  NB: the final_states may not be equal to the last nonpad
+        #  outputs because dropout is applied to the latter but not the former.
         all_outputs = []
         all_final_states = []
         for RNN_layer in self.RNNs:
             X, final_states = RNN_layer(X)
             X, _ = nn.utils.rnn.pad_packed_sequence(X)
-            X = F.dropout(
-                X, self.RNN_dropout, training=self.training,
-                inplace=True
-            )
             all_outputs.append(X)
             all_final_states.append(final_states)
+            X = F.dropout(
+                X, self.RNN_dropout, training=self.training, inplace=True
+            )
             X = nn.utils.rnn.pack_padded_sequence(
                 X, inputs_lengths.to('cpu'), enforce_sorted=False
             )
 
         # pack the final states together the way PyTorch does
+        # NB: this assumes that all RNN layers have the same dimensions
         if isinstance(all_final_states[0], tuple):
             # LSTM
             all_final_states = tuple(
@@ -392,9 +401,12 @@ class EncoderRNN(nn.Module):
 
         # "project" into natural params and convert back to canonical ordering
         for key, projection in self.projections[subnet_id].items():
-            natural_params_dict[key] = projection(all_outputs).permute(1, 0, 2)
+            RNN_layer = int(key.split('_')[1])
+            natural_params_dict[key] = projection(
+                all_outputs[RNN_layer]
+            ).permute(1, 0, 2)
 
-        return all_outputs, all_final_states
+        return all_outputs, all_final_states, inputs_lengths
 
 
 class EncoderTransformer(nn.Module):
@@ -404,6 +416,7 @@ class EncoderTransformer(nn.Module):
         FF_dropout, 
         T_dropout,
         subnets_params,
+        N_head=1,
         coupling=None,
         MAX_POOL=False,
         VERBOSE=True,
@@ -419,6 +432,7 @@ class EncoderTransformer(nn.Module):
         self.FF_dropout = FF_dropout
         self.T_dropout = T_dropout
         self.coupling = coupling
+        self.N_head = N_head
 
         # accumulate proprietary components (embeddings, projections)
         self.embeddings = nn.ModuleDict()
@@ -437,64 +451,57 @@ class EncoderTransformer(nn.Module):
             # decimation_factors
             self.decimation_factors[subnet_id] = subnet_params.decimation_factor
 
-            # penalize phonemes, etc.???
             # projections
-            # self.projections[subnet_id] = nn.ModuleDict()
-            # for key in subnet_params.data_mapping:
-            #     if key.startswith('encoder') and key.endswith('targets'):
+            self.projections[subnet_id] = nn.ModuleDict()
+            for key in subnet_params.data_mapping:
+                if key.startswith('encoder') and key.endswith('targets'):
 
-            #         # useful quantities
-            #         data_manifest = subnet_params.data_manifests[key]
-            #         output_layer = int(key.split('_')[1])
-            #         N_outputs = data_manifest.num_features
-            #         Ns_hidden = layer_sizes['encoder_%i_projection' % output_layer]
-            #         N_inputs = layer_sizes['encoder_rnn'][output_layer]*(
-            #             BIDIRECTIONAL + 1
-            #         )
+                    # useful quantities
+                    data_manifest = subnet_params.data_manifests[key]
+                    output_layer = int(key.split('_')[1])
+                    N_outputs = data_manifest.num_features
+                    Ns_hidden = layer_sizes['encoder_%i_projection' % output_layer]
+                    N_inputs = layer_sizes['encoder_rnn'][output_layer]
 
-            #         # accumulate this encoder projection
-            #         self.projections[subnet_id][key] = MultiLayerProjection(
-            #             N_inputs, Ns_hidden, N_outputs, self.FF_dropout,
-            #             input_list_index=output_layer,
-            #         )
+                    # accumulate this encoder projection
+                    self.projections[subnet_id][key] = MultiLayerProjection(
+                        N_inputs, Ns_hidden, N_outputs, self.FF_dropout,
+                    )
+
+        # position encodings
+        ####
+        # max sentence length = (~20 samples/sec)(6.25 sec) \approx 128
+        self.positional_encoding = RotaryPositionalEmbeddings(
+            # N_hidden//self.N_head, 128
+            N_hidden, 128
+        )
+        ####
 
         # from conv output dim to transformer input dim
         self.pretransformer = nn.Linear(
             layer_sizes['encoder_embedding'][-1], N_hidden
         )
         encoder_layer = nn.TransformerEncoderLayer(
-            d_model=N_hidden, nhead=2, dim_feedforward=N_hidden,
+            d_model=N_hidden, nhead=self.N_head, dim_feedforward=N_hidden,
             dropout=self.T_dropout
         )
-        self.transformer_encoder = nn.TransformerEncoder(
-            encoder_layer=encoder_layer,
-            num_layers=len(layer_sizes['encoder_rnn']),
-        )
-        
+        self.transformer_encoder = nn.ModuleList([
+            encoder_layer for _ in layer_sizes['encoder_rnn']
+        ])
+
         ###############
         # flatten_parameters()
         ###############
 
     def forward(self, inputs, subnet_id, natural_params_dict, image_dict):
 
-        # embed with temporal convolutions
-        X = self.embeddings[subnet_id](inputs)
-
         # get lengths of *downsampled* input sequences
         inputs_indices, inputs_lengths = sequences_tools(
             inputs[:, ::self.decimation_factors[subnet_id], :]
         )
 
-        # reverse? (a la Sutskever 2014); canonical ordering -> transformer
-        #   ordering, (T x N_cases x N_features)
-        if self.coupling == 'final_state':
-            X = reverse_sequences(X, inputs_indices, inputs_lengths)
-        X = X.permute(1, 0, 2)
-        
-        # pad
-        # X = nn.utils.rnn.pack_padded_sequence(
-        #     X, inputs_lengths.to('cpu'), enforce_sorted=False
-        # )
+        # embed with temporal convolutions
+        X = self.embeddings[subnet_id](inputs)
 
         # the original TF version used dropout on the RNN *inputs*
         X = self.pretransformer(X)
@@ -502,18 +509,37 @@ class EncoderTransformer(nn.Module):
             X, self.FF_dropout, training=self.training, inplace=True
         )
 
+        # add positional encodings
+        N_cases, T = X.shape[:2]
+        # X = self.positional_encoding(X.view([N_cases, T, self.N_head, -1]))
+        X = self.positional_encoding(X.unsqueeze(2)).squeeze(2)
+
+        # switch out of batch-first
+        X = X.permute(1, 0, 2)
+
         # transform
-        X = self.transformer_encoder(X)
-
-        # # "project" into natural params and convert back to canonical ordering
-        # for key, projection in self.projections[subnet_id].items():
-        #     natural_params_dict[key] = projection(X).permute(1, 0, 2)
-
+        # X = self.transformer_encoder(X)
+        all_outputs = []
+        for encoder_layer in self.transformer_encoder:
+            X = encoder_layer(X)
+            all_outputs.append(X)
+        
+        #######
+        # Shouldn't this really be at the final time *of each sequence*?
         # return only the mean across time?
-        # states = torch.mean(X, 0, keepdim=True)
-        states = X[-1:]
+        # states = torch.mean(X, 0, keepdim=True)      # average state
+        states = X[-1:]                               # final state
+        # states = X[inputs_lengths, torch.arange(len(inputs_lengths)), :].unsqueeze(0)
+        #######
 
-        return None, states
+        # "project" into natural params and convert back to canonical ordering
+        for key, projection in self.projections[subnet_id].items():
+            encoder_layer = int(key.split('_')[1])
+            natural_params_dict[key] = projection(
+                all_outputs[encoder_layer]
+            ).permute(1, 0, 2)
+
+        return all_outputs, states, inputs_lengths
 
 
 class FinalStateClassifier(nn.Module):
@@ -526,38 +552,47 @@ class FinalStateClassifier(nn.Module):
     ):
         super().__init__()
 
-        #-------#
+        #########
         # for now, assume that the decoder has no proprietary layers
         N_outputs = subnets_params[-1].data_manifests['decoder_targets'].num_features
-        #-------#
+        #########
 
-        # add a "projection"
+        # NB! Even though there is no decoder_rnn, len(layer_sizes['decoder_rnn'])
+        #  sets how deep into the encoder RNN the classifier looks.
+        N_decoded_layers = len(layer_sizes['decoder_rnn'])
+        output_layer_sizes = sum(layer_sizes['encoder_rnn'][-N_decoded_layers:])
+        N_in = output_layer_sizes*(1 + ENCODER_IS_BIDIRECTIONAL)
+
+        # add the "projection"
         self.classifier_head = MultiLayerProjection(
-            layer_sizes['encoder_rnn'][-1]*(1 + ENCODER_IS_BIDIRECTIONAL),
-            layer_sizes['decoder_projection'],
-            N_outputs, FF_dropout,
+            N_in, layer_sizes['decoder_projection'], N_outputs, FF_dropout,
         )
 
     def forward(
-        self, encoder_rnn_outputs, encoder_final_states, targets,
+        self, encoder_rnn_outputs, encoder_final_states, targets, inputs_lengths,
         natural_params_dict, image_dict
     ):
         '''
-        encoder_rnn_outputs, targets, and natural_params_dict aren't necessary
-        but are included here for consistency with DecoderAttentionRNN
+        encoder_rnn_outputs, targets, inputs_lengths, and
+        image_dict aren't necessary but are included here for consistency with
+        DecoderAttentionRNN.
         '''
 
-        # use only hidden states, not cell states
+        # (N_layers x N_cases x N_hidden)
         if isinstance(encoder_final_states, tuple):
-            # LSTM
+            # LSTM: use only hidden, not cell, states; 
             hidden_states = encoder_final_states[0]
         else:
             hidden_states = encoder_final_states
 
-        # "project" (expects a *list*) and expand to length-1 sequence
-        natural_params_dict['decoder_targets'] = self.classifier_head(
-            hidden_states)[:, None, :]
+        # treat activities at all layers as features on all fours w/each other
+        #   -> (N_cases x N_layers*N_hidden)
+        hidden_states = hidden_states.permute(1, 0, 2).flatten(start_dim=1)
 
+        #   -> (N_cases x 1 x N_classes)
+        natural_params_dict['decoder_targets'] = self.classifier_head(
+            hidden_states).unsqueeze(1)
+        
         ##############
         # targets, image_dict
         ##############
@@ -597,7 +632,7 @@ class DecoderRNN(nn.Module):
         self.embedding = MLLinearEmbedding(
             N_outputs, layer_sizes['decoder_embedding'], self.FF_dropout
         )
-        
+
         ############
         # You could in theory just make the decoder like the encoder: *loop*
         #  across layers of the RNN and save all outputs.  E.g., you could
@@ -619,13 +654,16 @@ class DecoderRNN(nn.Module):
         )
 
     def forward(
-        self, encoder_rnn_outputs, encoder_final_states, targets,
+        self, encoder_rnn_outputs, encoder_final_states, targets, inputs_lengths,
         natural_params_dict, image_dict
     ):
         '''
         encoder_rnn_outputs aren't really necessary but are included here for
         consistency with DecoderAttentionRNN
         '''
+
+        # ...
+        states = encoder_final_states
 
         # Are we testing or training?
         if targets is None:
@@ -638,16 +676,15 @@ class DecoderRNN(nn.Module):
             inputs = torch.full([N_cases, 1], self.SOS_id).to(
                 encoder_rnn_outputs[-1].device
             )
-            
+
             # loop
-            states = encoder_final_states
             natural_params = []
             for i in range(self.max_hyp_length):
                 one_step_natural_params, states = self.forward_core(inputs, states)
                 natural_params.append(one_step_natural_params)
                 _, most_probable_classes = one_step_natural_params.topk(1)
                 inputs = most_probable_classes[:, :, 0].detach()
-                
+
                 # terminate if all most_probable_classes are EOS?
 
             final_states = states
@@ -656,7 +693,7 @@ class DecoderRNN(nn.Module):
             # ...we're training; use *shifted* targets as inputs...
             X = targets.roll(1, 1)
             X[:, 0] = self.SOS_id
-            natural_params, final_states = self.forward_core(X, encoder_final_states)
+            natural_params, final_states = self.forward_core(X, states)
 
         # update the natural_params_dict
         natural_params_dict['decoder_targets'] = natural_params
@@ -675,8 +712,8 @@ class DecoderRNN(nn.Module):
         # run through RNN, converting canonical to RNN ordering
         outputs, final_states = self.RNN(X.permute(1, 0, 2), initial_state)
 
-        # "project" (expects a *list*) and convert back to canonical ordering
-        natural_params = self.decoder_projection([outputs]).permute(1, 0, 2)
+        # "project" and convert back to canonical ordering
+        natural_params = self.decoder_projection(outputs).permute(1, 0, 2)
 
         return natural_params, final_states
 
@@ -684,6 +721,7 @@ class DecoderRNN(nn.Module):
 class DecoderAttentionRNN(DecoderRNN):
     def __init__(
         self,
+        key_length,
         layer_sizes,
         FF_dropout,
         RNN_dropout,
@@ -693,50 +731,55 @@ class DecoderAttentionRNN(DecoderRNN):
         RNN_type,
         N_hidden_attention=200,
     ):
+
+        # It doesn't really make sense to have layerwise cross-attention with
+        #  variable numbers of units per encoder layer, because the context
+        #  is a weighted sum of tokens across time *and layers*.  Plus PyTorch
+        #  wants multilayer RNNs to have a fixed number of hidden units across
+        #  layers anyway.  So we assume this throughout.
+
+        # create a DecoderRNN
         super().__init__(
             layer_sizes, FF_dropout, RNN_dropout, subnets_params, SOS_id,
             max_hyp_length, RNN_type,
         )
 
-        # attention; Ns are necessarily the case
-        N_hidden = layer_sizes['decoder_rnn'][0]
-        N_outputs_RNN = N_hidden
-        N_layers_RNN = len(layer_sizes['decoder_rnn'])
+        # add attention; Ns are necessarily the case
+        query_length = layer_sizes['decoder_rnn'][-1]
+        N_layers = len(layer_sizes['decoder_rnn'])
         self.attention = BahdanauAttention(
-            N_hidden, N_outputs_RNN, N_hidden_attention, N_layers_RNN
+            query_length, key_length, N_hidden_attention, N_layers
         )
-        
-        # the RNN input is [embedded_input, "context"], so have to recreate it
-        N_in = self.RNN.input_size + N_hidden
+
+        # RNN's input is [embedded_input, "context"], so we have to overwrite it
         self.RNN = getattr(nn, RNN_type)(
-            N_in, N_hidden, num_layers=N_layers_RNN, dropout=RNN_dropout
+            input_size=self.RNN.input_size + key_length,
+            hidden_size=query_length,
+            num_layers=N_layers,
+            dropout=RNN_dropout
         )
 
     def forward(
-        self, encoder_rnn_outputs, encoder_final_states, targets,
+        self, encoder_outputs, encoder_final_states, targets, inputs_lengths,
         natural_params_dict, image_dict
     ):
 
-        # encoder_rnn_outputs are in RNN ordering
-        N_cases = encoder_rnn_outputs[-1].shape[1]
+        # encoder_outputs are in RNN ordering
+        N_cases = encoder_outputs[-1].shape[1]
         iMax = targets.shape[1] if targets is not None else self.max_hyp_length
-            
-        # The decoder will compute attention for the outputs at layer l using
-        #  the states at layer l.  Here we collect the outputs into a tensor of
-        #  size (N_layers x T x N_cases x N_features)
-        encoder_outputs = torch.stack(encoder_rnn_outputs[-self.RNN.num_layers:])
-        
+
+        # use as many keys as there are decoder layers
+        encoder_outputs = torch.stack(encoder_outputs[-self.RNN.num_layers:])
+
         # and the input to the embedding must have size (N_cases x 1)
-        inputs = torch.full([N_cases, 1], self.SOS_id).to(
-            encoder_outputs.device
-        )
+        inputs = torch.full([N_cases, 1], self.SOS_id).to(encoder_outputs.device)
         states = encoder_final_states
         natural_params = []
         attn_weights = []
 
         for i in range(iMax):
             one_step_natural_params, states, one_step_attn_weights = self.forward_step(
-                inputs, states, encoder_outputs
+                inputs, states, encoder_outputs, inputs_lengths
             )
             natural_params.append(one_step_natural_params)
             attn_weights.append(one_step_attn_weights)
@@ -751,7 +794,7 @@ class DecoderAttentionRNN(DecoderRNN):
 
         # (N_cases x T_out x N_out)
         natural_params_dict['decoder_targets'] = torch.cat(natural_params, dim=1)
-        
+
         # just for plotting
         if not self.training:
             # (N_layers x Te x N_cases x Td) -> (N_cases x N_layers x Td x Te)
@@ -763,14 +806,15 @@ class DecoderAttentionRNN(DecoderRNN):
             attention_images = torchvision.utils.make_grid(
                 attn_weights[:, -1:, :, :]
             )
+
             # "average" over the duplicated single channel
             image_dict['attention'] = attention_images.mean(dim=0)
 
-    def forward_step(self, inputs, states, encoder_outputs):
-        ''' 
+    def forward_step(self, inputs, states, encoder_outputs, inputs_lengths):
+        '''
         inputs:             (N_cases x 1)
-        states:             (N_layers x N_cases x N_hidden_RNN)
-        encoder_outputs:    (N_layers x T x N_cases x N_out_encoder_RNN)
+        states:             (N_layers x N_cases x N_hidden_decoder)
+        encoder_outputs:    (N_layers x T x N_cases x N_hidden_encoder)
         '''
 
         # get attention weights
@@ -779,11 +823,13 @@ class DecoderAttentionRNN(DecoderRNN):
             queries = states[0][:, None, :, :]
         else:
             queries = states[:, None, :, :]
-        context, attn_weights = self.attention(queries, encoder_outputs)
+        context, attn_weights = self.attention(
+            queries, encoder_outputs, inputs_lengths
+        )
 
         # embed inputs---into size (N_cases x 1 x M)
         X = self.embedding(inputs)
-        
+
         # concatenate "context" onto embedded input
         X = torch.cat((X, context[:, None, :]), dim=2)
 
@@ -795,8 +841,8 @@ class DecoderAttentionRNN(DecoderRNN):
         # run through RNN, converting canonical to RNN ordering
         outputs, new_states = self.RNN(X.permute(1, 0, 2), states)
 
-        # "project" (expects a *list*) and convert back to canonical ordering
-        natural_params = self.decoder_projection([outputs]).permute(1, 0, 2)
+        # "project" and convert back to canonical ordering
+        natural_params = self.decoder_projection(outputs).permute(1, 0, 2)
 
         # we return attn_weights only for plotting purposes
         return natural_params, new_states, attn_weights
@@ -817,7 +863,7 @@ class BahdanauAttention(nn.Module):
         )
         self.N_layers = N_layers
 
-    def forward(self, queries, keys):
+    def forward(self, queries, keys, inputs_lengths):
         '''
         queries:    (N_layers x 1 x N_cases x query_length)
         keys:       (N_layers x T x N_cases x key_length)
@@ -832,19 +878,24 @@ class BahdanauAttention(nn.Module):
                 self.V_list, self.Q_list, self.K_list, queries, keys
             )
         ])
-        
-        # -> (N_layers*T x N_cases) to normalize over *both* layers and time
-        N_cases = scores.shape[2]
-        scores = scores.reshape([-1, N_cases])
 
-        # normalize and compute convex combination of keys
+        ######
+        # Masking doesn't actually seem to help
+        # mask out (send to -inf) scores beyond the end of the sequences
+        T, N_cases = scores.shape[1:3]
+        mask = torch.arange(T, device=scores.device)[:, None] < inputs_lengths[None, :]
+        scores = scores.masked_fill(mask[None, :, :, None] == 0, float('-inf'))
+        ######
+
+        # -> (N_layers*T x N_cases x 1) to normalize over *both* layers and time
+        scores = scores.view([-1, N_cases])
+
+        # normalize and compute convex combination of keys across layers/time
         weights = F.softmax(scores, dim=0)
-        weights = weights.reshape([self.N_layers, -1, N_cases, 1])
-
-        # sum across N_layers, T -> (N_cases x key_length)
+        weights = weights.view([-1, T, N_cases, 1])
         context = torch.sum(weights*keys, dim=(0, 1))
-        
-        # we return the attention weights only for plotting purposes
+
+        # (N_cases x key_length), plus attention weights for plotting
         return context, weights
 
 
@@ -901,12 +952,12 @@ class MLConvEmbedding(nn.Module):
 
         # there may be multiple layers
         self.layers = nn.ModuleList()
-        
+
         # distribute decimation over multiple layers
         layer_strides = close_factors(self.decimation_factor, len(layer_sizes))
         if VERBOSE:
             print('Temporally convolving with strides ' + repr(layer_strides))
-        
+
         # construct embedding network
         for N_out, layer_stride in zip(layer_sizes, layer_strides):
             self.layers.append(nn.Conv1d(
@@ -950,12 +1001,10 @@ class MultiLayerProjection(nn.Module):
         Ns_hidden,
         N_outputs,
         FF_dropout,
-        input_list_index=-1
     ):
         super().__init__()
 
         self.FF_dropout = FF_dropout
-        self.input_list_index = input_list_index
         self.projections = nn.ModuleList()
         Ns_out = Ns_hidden + [N_outputs]
         N_in = N_inputs
@@ -963,22 +1012,27 @@ class MultiLayerProjection(nn.Module):
             self.projections.append(nn.Linear(N_in, N_out))
             N_in = N_out
 
-    def forward(self, inputs):
+    def forward(self, X):
+        '''
+        arguments:
+            X:  input tensor of size (* x N_inputs)
+        returns:
+            Y:  output tensor of size (* x N_outputs)
+        '''
 
-        X = inputs[self.input_list_index]
         for projection in self.projections[:-1]:
             X = F.dropout(
                 F.relu(projection(X)), self.FF_dropout, training=self.training,
                 inplace=False
             )
 
-        # no nonlinearity on the final layer--but there is dropout (!)
         #############
-        ### return F.dropout(self.projections[-1](X), self.FF_dropout, training=self.training)
+        # no nonlinearity on the final layer--but there is dropout (!)
+        # return F.dropout(self.projections[-1](X), self.FF_dropout, training=self.training)
         return self.projections[-1](X)
         #############
-        
-        
+
+
 def context_reshape(states, N_layers, N_directions=2):
     '''
     Pytorch RNNs return the states with size
@@ -1000,7 +1054,7 @@ def context_reshape(states, N_layers, N_directions=2):
     The concatention ordering of the RNN was taken from here:
         https://discuss.pytorch.org/t/
         how-can-i-know-which-part-of-h-n-of-bidirectional-rnn-is-for-backward-process/3883
-    '''    
+    '''
 
     # useful sizes
     _, N_cases, N_features = states.shape
@@ -1113,7 +1167,7 @@ class SequenceTrainer():
                 if coder == 'encoder':
                     d = metadata_dicts[coder]['decimation_factor']
                     targets = targets[:, ::d, :]
-                    if sequence_net.coupling == 'final_state':
+                    if sequence_net.coupling == 'final state':
                         targets = reverse_sequences(targets, indices, lengths)
 
                 # accumulate loss

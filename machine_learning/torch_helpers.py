@@ -186,7 +186,7 @@ def sequences_tools(sequences, as_tuple=True):
         int32 tensor of size (N_cases)
     '''
 
-    # mask_binariwise is a (N_cases x max_sequence_length) matrix with 0s
+    # binary_mask is a (N_cases x max_sequence_length) matrix with 0s
     #  wherever all elements of an input token are simultaneously zero,
     #  and 1s elsewhere.  Since all elements of an input token are
     #  simultaneously zero only in the zero-padding, the 1s will be
