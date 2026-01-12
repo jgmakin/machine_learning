@@ -5,17 +5,203 @@ import random
 from functools import reduce
 
 # third-party
-import torch
-from torch.utils.data import Dataset
-import torchvision
 import numpy as np
 from PIL import Image
-import tensorflow as tf
-import tensorflow_datasets as tfds
+
+try:
+    import torch
+    from torch.utils.data import Dataset
+    from torchvision.transforms import v2
+    import torchvision
+except ModuleNotFoundError:
+    print('WARNING: torch missing; skipping')
+
+try:
+    import tensorflow as tf
+    import tensorflow_datasets as tfds
+except ModuleNotFoundError:
+    print('WARNING: TensorFlow missing; skipping')
+
 
 # local
 from utils_jgm.machine_compatibility_utils import MachineCompatibilityUtils
 MCUs = MachineCompatibilityUtils()
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+
+class LocalCelebA(torchvision.datasets.CelebA):
+    def __init__(self, root=os.path.join(MCUs.get_path('data')), *args, **kwargs):
+        super().__init__(root=root, *args, **kwargs)
+
+    @property
+    def raw_folder(self) -> str:
+        # return os.path.join(self.root, self.__class__.__name__, 'raw')
+        return os.path.join(self.root, 'MNIST', 'raw')
+
+    def __getitem__(self, index: int) -> tuple[any, any]:
+        """
+        Args:
+            index (int): Index
+
+        Returns:
+            image (): matrix of size image_height x image_width
+        """
+
+        # apply any 
+        class_id = self.targets[index]
+        if self.target_transform is not None:
+            class_id = self.target_transform(class_id)
+
+        image = self._image_proc(index)
+
+        return image, class_id
+
+    def _image_proc(self, index):
+        image = self.data[index]
+
+        # doing this so that it is consistent with all other datasets
+        # to return a PIL Image
+        image = Image.fromarray(image.numpy(), mode="L")
+
+        if self.transform is not None:
+            image = self.transform(image)
+
+        return image
+
+
+class LocalOxfordFlowers(torchvision.datasets.Flowers102):
+    def __init__(
+        self,
+        *args,
+        root=os.path.join(MCUs.get_path('data')),
+        size=(64, 64),
+        # OF has a tiny training set, so swap w/the large test set
+        split='test',
+        **kwargs
+    ):
+        super().__init__(*args, root=root, split=split, **kwargs)
+        self.device = device
+        self.size = size
+        
+        # 1. Flowers102 stores paths in self._image_files
+        # We load, resize, and stack them onto the GPU immediately
+        processed_imgs = []
+        print(f"Loading Oxford Flowers to {device}...")
+        
+        # Temporary transform to unify sizes for the tensor stack
+        init_transform = v2.Compose([
+            v2.Resize(self.size),
+            v2.ToImage(),
+            v2.ToDtype(torch.float32, scale=True)
+        ])
+
+        for img_path in self._image_files:
+            img = Image.open(img_path).convert("RGB")
+            processed_imgs.append(init_transform(img))
+        
+        # Stack into (N, 3, H, W) and move to device
+        self.data = torch.stack(processed_imgs).to(self.device)
+        
+        # 2. Move labels to GPU (Flowers102 labels are in self._labels)
+        self.targets = torch.tensor(self._labels, device=self.device)
+
+    def __getitem__(self, index: int):
+        image = self.data[index]
+        label = self.targets[index]
+
+        # Apply any runtime augmentations (Flips, etc.)
+        if self.transform is not None:
+            image = self.transform(image)
+
+        return image, label
+
+
+class LocalCIFAR10(torchvision.datasets.CIFAR10):
+    def __init__(
+        self, *args, root=os.path.join(MCUs.get_path('data')), **kwargs
+    ):
+        FLATTEN = kwargs.pop('FLATTEN', False)
+        super().__init__(*args, root=root, **kwargs)
+        self.device = device
+        
+        # 1. CIFAR10 stores data as a (50000, 32, 32, 3) numpy array
+        # Move to GPU, convert to float, and normalize
+        self.data = torch.from_numpy(self.data).to(self.device).float() / 255.0
+        
+        # 2. (N, H, W, C) -> (N, C, H, W)
+        self.data = self.data.permute(0, 3, 1, 2)
+        if FLATTEN:
+            self.data = self.data.reshape((self.data.shape[0], -1))
+        
+        # 3. Move targets to GPU
+        # self.targets is a list, so we convert to tensor first
+        self.targets = torch.tensor(self.targets, device=self.device)
+
+    def __getitem__(self, index: int):
+        image = self.data[index]
+        label = self.targets[index]
+
+        # Standard transforms like ToTensor() should be avoided here
+        # Use only tensor-compatible transforms (e.g., RandomCrop)
+        if self.transform is not None:
+            image = self.transform(image)
+
+        return image, label
+
+
+class LocalMNIST(torchvision.datasets.MNIST):
+    def __init__(
+        self, *args, root=os.path.join(MCUs.get_path('data')), **kwargs
+    ):
+
+        FLATTEN = kwargs.pop('FLATTEN', False)
+        super().__init__(root=root, *args, **kwargs)
+
+        self.device = device
+        self.data = self.data.to(self.device).float()/255.0
+        if FLATTEN:
+            self.data = self.data.reshape((self.data.shape[0], -1))
+        else:
+            # add channel dimension
+            self.data = self.data.unsqueeze(1)  
+        
+        self.targets = self.targets.to(self.device)
+
+    @property
+    def raw_folder(self) -> str:
+        # return os.path.join(self.root, self.__class__.__name__, 'raw')
+        return os.path.join(self.root, 'MNIST', 'raw')
+
+    def __getitem__(self, index: int) -> tuple[any, any]:
+        """
+        Args:
+            index (int): Index
+
+        Returns:
+            image (): matrix of size image_height x image_width
+        """
+
+        # apply any 
+        class_id = self.targets[index]
+        image = self.data[index]
+
+        if self.target_transform is not None:
+            class_id = self.target_transform(class_id)
+
+        # ...
+        # image = self._image_proc(image)
+
+        return image, class_id
+
+    def _image_proc(self, image):
+        # doing this so that it is consistent with all other datasets
+        # to return a PIL Image
+        image = Image.fromarray(image.numpy(), mode="L")
+
+        if self.transform is not None:
+            image = self.transform(image)
+
+        return image
 
 
 # define a new class to work around path issues

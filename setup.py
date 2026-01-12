@@ -8,11 +8,12 @@ install_requires=['numpy', 'scipy']
 python_subversion = int(sys.version.split('.')[1])
 if python_subversion > 8:
     install_requires = [
-        'numpy', 'scipy', 'tensorflow', 'tensorflow-probability',
-        'tensorflow-datasets', 'torch', 'torchvision', 'seaborn',
-        'matplotlib', 'tensorflow-datasets'
+        'numpy', 'scipy', 'seaborn', 'matplotlib',
+        # 'tensorflow', 'tensorflow-probability','tensorflow-datasets'
+        # 'torch', 'torchvision',
     ]
 else:
+    print('OLD!!')
     install_requires = [
         'numpy==1.22.4', 'scipy',
         #####

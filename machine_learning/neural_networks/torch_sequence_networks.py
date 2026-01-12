@@ -13,7 +13,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchvision
 from torch.utils.tensorboard import SummaryWriter
-from torchtune.modules import RotaryPositionalEmbeddings
+# from torchtune.modules import RotaryPositionalEmbeddings
 #######
 # from torch.profiler import profile, record_function, ProfilerActivity
 #######
@@ -132,7 +132,7 @@ class Sequence2Sequence(nn.Module):
                 )
                 self.ENCODER_IS_BIDIRECTIONAL = False
             case _: 
-                raise ValueError('Unrecognized decoder_type')
+                raise ValueError('Unrecognized encoder_type')
 
         # reshape the context to pass to the decoder
         self.reshape_context = partial(
@@ -1430,12 +1430,15 @@ def get_cross_entropy_fxn(distribution):
     Also NB: no lambda functions for compatibility with pickle
     '''
 
-    if distribution == 'Gaussian':
-        return Gaussian_cross_entropy
-    elif distribution == 'categorical':
-        return categorical_cross_entropy
-    else:
-        raise NotImplementedError('%s cross entropy not yet implemented!' % distribution)
+    match distribution:
+        case 'Gaussian':
+            return Gaussian_cross_entropy
+        case 'categorical':
+            return categorical_cross_entropy
+        case _:
+            raise NotImplementedError(
+                '%s cross entropy not yet implemented!' % distribution
+            )
 
 
 def Gaussian_cross_entropy(natural_params, targets):
