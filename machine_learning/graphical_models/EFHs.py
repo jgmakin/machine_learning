@@ -11,17 +11,15 @@ import torch.nn.functional as F
 # import torch.utils
 # import torch.distributions
 # from torch.utils.data import DataLoader
-from torchvision import datasets, transforms
+from torch.utils.data import IterableDataset 
 
 import numpy as np
 import matplotlib.pyplot as plt
-from matplotlib.cm import get_cmap
 
 # local libraries
-from neural_models.probabilistic_population_codes import TorchMultisensoryData
 from utils_jgm.machine_compatibility_utils import MachineCompatibilityUtils
 from utils_jgm.tikz_pgf_helpers import tpl_save
-from utils_jgm.toolbox import tau, print_fixed
+from utils_jgm.toolbox import tau, print_fixed, auto_attribute
 MCUs = MachineCompatibilityUtils()
 
 tau = torch.tensor(tau)
@@ -41,26 +39,123 @@ Created:        12/08/2025
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 torch.set_default_device(device)
+# assume probs sum in dimension 1!!!
+# NB: moments should be divided by N_trials to be probs, but
+#   PyTorch will automatically normalize
+# counts = torch.distributions.Multinomial(
+#     probs=moments.permute([0, 2, 3, 1]),
+#     total_count=self.N_trials
+# ).sample()
+# samples = counts.permute([0, 3, 1, 2])
 
 
 class EFH(nn.Module):
     def __init__(
         self,
-        N_visible=784,
-        N_hidden=256,
+        C_in=2,
+        C_out=20,
+        kernel_width=1,
+        stride=1,
+        CONV=False,
         emission_family='Bernoulli',
-        posterior_family='Bernoulli',
-        N_trials=4,  # for multinomial sampler
+        posterior_family='multinomial',
+        N_trials=4,
+        initialization='other',
+        # initialization='Glorot',
     ):
-        super().__init__()
-        self.W = nn.Parameter(torch.randn(N_hidden, N_visible) * 0.01)
-        self.b_vis = nn.Parameter(torch.zeros(N_visible))
-        self.b_hid = nn.Parameter(torch.zeros(N_hidden))
 
+        super().__init__()
+        self.b_vis = nn.Parameter(torch.zeros(C_in))
+        self.b_hid = nn.Parameter(torch.zeros(C_out))
+        self.W = nn.Parameter(
+            torch.empty(C_out, C_in, kernel_width, kernel_width)
+        )
+        match initialization:
+            case 'Glorot':
+                # use Xavier/Glorot for Sigmoid/Softmax families:
+                nn.init.xavier_uniform_(self.W) 
+            case _:
+                # OR use a very small normal distribution (Common RBM trick):
+                # nn.init.normal_(self.W, mean=0, std=0.01)
+                nn.init.normal_(self.W, mean=0, std=0.001)
+        self.W.data = self.W.data.to(memory_format=torch.channels_last)
+
+        self.stride = stride
         self.emission_family = emission_family
         self.posterior_family = posterior_family
         self.N_trials = N_trials
 
+    def infer(self, vis):
+        # assert vis.dim() > 2
+
+        eta = F.conv2d(vis, self.W, self.b_hid, stride=self.stride, padding=0)
+        mu = self.inverse_link(eta, self.posterior_family)
+        samples = self.moments_to_samples(mu, self.posterior_family)
+
+        return mu, samples
+
+    def emit(self, hid):
+        eta = F.conv_transpose2d(
+            hid, self.W, self.b_vis, stride=self.stride, padding=0,
+            output_padding=0
+        )
+        mu = self.inverse_link(eta, self.emission_family)
+        samples = self.moments_to_samples(mu, self.emission_family)
+        return mu, samples
+
+    def forward(self, hid, N_CD_steps):
+        # block Gibbs sample
+        for _ in range(N_CD_steps):
+            mu_vis, vis = self.emit(hid)
+            mu_hid, hid = self.infer(vis)
+
+        return mu_vis, vis, mu_hid, hid
+
+    @torch.no_grad()
+    def updown(self, vis, USE_MEANS=True):
+        mu_H, H = self.infer(vis)
+        hid = mu_H if USE_MEANS else H
+        mu_V, V = self.emit(hid)
+        vis = mu_V if USE_MEANS else V
+        return vis
+
+    @torch.no_grad()
+    def generate(self, N_CD_steps, num_examples, H, W, USE_MEANS=True):
+
+        # ...
+        data_shape = (num_examples, self.W.shape[1], H, W)
+        
+        # assume that generation starts from standard normal noise
+        V0 = torch.randn(data_shape)
+
+        mu_H0, H0 = self.infer(V0)
+        hid = mu_H0 if USE_MEANS else H0
+        mu_VN, _, _, _ = self.forward(hid, N_CD_steps)
+    
+        return mu_VN
+
+    @torch.no_grad()
+    def _gradient_update(self, V0, H0, VN, HN):
+
+        N = V0.shape[0]
+        w_shape = self.W.shape
+
+        # this is secretly just a 1x1 conv (perhaps a linear layer)
+        if w_shape[2] == 1 and w_shape[3] == 1:
+            grad_W_pos = (H0.view(N, -1).T @ V0.view(N, -1)).view(w_shape)
+            grad_W_neg = (HN.view(N, -1).T @ VN.view(N, -1)).view(w_shape)
+        else:
+            grad_W_pos = nn.grad.conv2d_weight(
+                V0, w_shape, H0, stride=self.stride, padding=0
+            )
+            grad_W_neg = nn.grad.conv2d_weight(
+                VN, w_shape, HN, stride=self.stride, padding=0
+            )
+        self.W.grad = (grad_W_neg - grad_W_pos)/N
+        self.b_vis.grad = -(V0 - VN).sum(dim=(0, 2, 3))/N
+        self.b_hid.grad = -(H0 - HN).sum(dim=(0, 2, 3))/N
+
+    @torch.no_grad()
     def moments_to_samples(self, moments, distribution, **kwargs):
         match distribution:
             case 'Bernoulli':
@@ -69,19 +164,9 @@ class EFH(nn.Module):
                 return torch.distributions.Poisson(rate=moments, **kwargs).sample()
             case 'multinomial':
                 samples = multinomial_gemini(moments/self.N_trials, self.N_trials)
-                
-                # assume probs sum in dimension 1!!!
-                # NB: moments should be divided by N_trials to be probs, but
-                #   PyTorch will automatically normalize
-                # counts = torch.distributions.Multinomial(
-                #     probs=moments.permute([0, 2, 3, 1]),
-                #     total_count=self.N_trials
-                # ).sample()
-                # samples = counts.permute([0, 3, 1, 2])
-
                 # mean-field
                 # samples = mu
-
+                
                 return samples
             case _:
                 raise NotImplementedError(
@@ -93,7 +178,10 @@ class EFH(nn.Module):
             case 'Bernoulli':
                 return torch.sigmoid(natural_parameters)
             case 'Poisson':
+                ######
+                # clamped exp or softplus?
                 return torch.exp(natural_parameters)
+                ######
             case 'multinomial':
                 # assume probs sum in dimension 1!!!
                 # E[X] = N*p
@@ -103,290 +191,297 @@ class EFH(nn.Module):
                     'Inverse link not implemented for %s distribution' % distribution
                 )
 
-    def conditional(self, X, weights, biases, family):
-        eta = F.linear(X, weights, biases)
-        mu = self.inverse_link(eta, family)
-        samples = self.moments_to_samples(mu, family)
-        return mu, samples
 
-    def infer(self, vis):
-        return self.conditional(vis, self.W, self.b_hid, self.posterior_family)
-
-    def emit(self, hid):
-        return self.conditional(hid, self.W.T, self.b_vis, self.emission_family)
-
-    def forward(self, hid, N_steps):
-        # block Gibbs sample
-        for _ in range(N_steps):
-            mu_vis, vis = self.emit(hid)
-            mu_hid, hid = self.infer(vis)
-
-        return mu_vis, vis, mu_hid, hid
-
-    def generate(self, N_CD_steps, num_examples):
-
-        # assume that generation starts from standard normal noise
-        V0 = torch.randn((num_examples, self.W.shape[1]))
-
-        # _, H0 = self.infer(V0)
-        # mu_VN, _, _, _ = self.forward(H0, N_CD_steps)
-
-        mu_H0, _ = self.infer(V0)
-        mu_VN, _, _, _ = self.forward(mu_H0, N_CD_steps)
-    
-        return mu_VN
-
-
-class GEFH(EFH):
+class EFHtrainer():
+    @auto_attribute
     def __init__(
         self,
-        C_visible=2,
-        C_hidden=20,
-        kernel_width=10,
-        emission_family='Bernoulli',
-        posterior_family='multinomial',
-        N_trials=4,
-        initialization='other',
-        # initialization='Glorot',
+        efh,
+        training_loader,
+        validator,
+        N_CD_steps=1,
+        N_steps=1000,
+        N_steps_print=None,
+        data_init_fraction=0,  # 0.04
     ):
+        self.optimizer = torch.optim.Adam(self.efh.parameters(), lr=0.001)
+        self.N_steps_print = N_steps//5 if N_steps_print is None else N_steps_print
 
-        super().__init__()
-        # For convolutional networks, it doesn't really make much sense to
-        #  specify the total number of hidden units, because bigger images
-        #  will drive more units (etc.).  Instead, we simply specify the
-        #  number of *channels*.
-        self.b_vis = nn.Parameter(torch.zeros(C_visible))
-        self.b_hid = nn.Parameter(torch.zeros(C_hidden))
-        self.W = nn.Parameter(
-            torch.empty(C_hidden, C_visible, kernel_width, kernel_width)
-        )
-        match initialization:
-            case 'Glorot':
-                # use Xavier/Glorot for Sigmoid/Softmax families:
-                nn.init.xavier_uniform_(self.W) 
-            case _:
-                # OR use a very small normal distribution (Common RBM trick):
-                # nn.init.normal_(self.W, mean=0, std=0.01)
-                nn.init.normal_(self.W, mean=0, std=0.001)
-        self.stride = 1
-
-        self.emission_family = emission_family
-        self.posterior_family = posterior_family
-        self.N_trials = N_trials
-
-    def infer(self, vis):
-        eta = F.conv2d(vis, self.W, self.b_hid, stride=self.stride, padding=1)
-        mu = self.inverse_link(eta, self.posterior_family)
-        samples = self.moments_to_samples(mu, self.posterior_family)
-
-        return mu, samples
-
-    def emit(self, hid):
-        eta = F.conv_transpose2d(
-            hid, self.W, self.b_vis, stride=self.stride, padding=1,
-            output_padding=0
-        )
-        mu = self.inverse_link(eta, self.emission_family)
-        samples = self.moments_to_samples(mu, self.emission_family)
-        return mu, samples
-
-    def generate(self, N_CD_steps, num_examples, H, W):
-
-        data_shape = (num_examples, self.W.shape[1], H, W)
-        
-        # assume that generation starts from standard normal noise
-        V0 = torch.randn(data_shape)
-
-        _, H0 = self.infer(V0)
-        mu_VN, _, _, _ = self.forward(H0, N_CD_steps)
-    
-        return mu_VN
-
-
-# Training loop
-def train_EFH(
-    training_loader,
-    validator,
-    N_CD_steps=1,
-    N_steps=1000,
-    N_steps_print=None,
-    CONV=False,
-    data_init_fraction=0,  # 0.04
-    **EFH_kwargs,
-):
-    
-    if N_steps_print is None:
-        N_steps_print = N_steps//5
-
-    efh = GEFH(**EFH_kwargs) if CONV else EFH(**EFH_kwargs)
-    optimizer = torch.optim.Adam(efh.parameters(), lr=0.001)
-
-    start = time.time()
-    for step, (V0, _) in enumerate(training_loader):
-        total_loss = 0
-        N_examples_per_batch = V0.shape[0]
-            
-        # "positive" phase
-        _, H0 = efh.infer(V0)
-
-        # Abdulsalam 2025
-        if data_init_fraction == 0: 
-            H0_neg = H0
-        else:
-            # this could be made much more efficient....
-            N_data_init_examples = round(N_examples_per_batch*data_init_fraction)
-            inds = np.random.choice(N_examples_per_batch, N_data_init_examples)
-            V_random = torch.randn((N_data_init_examples, *V0.shape[1:]))
-            _, H_random = efh.infer(V_random)
-
-            H0_neg = H0
-            H0_neg[inds] = H_random
-
-        # negative phase
-        # mu_VN, VN, mu_HN, HN = efh(H0_neg, N_CD_steps)
-        mu_VN, VN, mu_HN, HN = efh(H0, N_CD_steps)
-        ##########
-        # standard GEH hack
-        HN = mu_HN
-        ##########
-
-        # CD-N
-        if CONV:
-            grad_W_pos = nn.grad.conv2d_weight(V0, efh.W.shape, H0, stride=efh.stride, padding=1)
-            grad_W_neg = nn.grad.conv2d_weight(VN, efh.W.shape, HN, stride=efh.stride, padding=1)
-            efh.W.grad = (grad_W_neg - grad_W_pos) / N_examples_per_batch
-            efh.b_vis.grad = -(V0 - VN).sum(dim=(0, 2, 3)) / N_examples_per_batch
-            efh.b_hid.grad = -(H0 - HN).sum(dim=(0, 2, 3)) / N_examples_per_batch
-        else:
-            efh.W.grad = - (H0.T @ V0 - HN.T @ VN) / N_examples_per_batch
-            efh.b_vis.grad = -(V0 - VN).sum(dim=0) / N_examples_per_batch
-            efh.b_hid.grad = -(H0 - HN).sum(dim=0) / N_examples_per_batch
-
-        optimizer.step()
-        optimizer.zero_grad()
-
-        loss = torch.mean((V0 - mu_VN)**2)
-        total_loss += loss.item()
-
-        if (step+1) % N_steps_print == 0:
-            torch.cuda.synchronize()
-            
-            print_fixed("step", step, 6, 0, 0, end='')
-            print_fixed("infer time", time.time() - start, 8, 3, 0, end='')
-            # print_fixed("loss", total_loss, 6, 2, 0, end='')
-            print_fixed("loss", total_loss, 6, 2, -2, end='')
-
-            efh.eval()
-            validator(efh, step)
-            efh.train()
-            
-            print()
-            start = time.time()
-
-        if step == N_steps:
-            break
-
-    return efh
-
-
-# Training loop
-def train_DBN(
-    training_loader,
-    validator,
-    N_EFH=1,
-    N_CD_steps=1,
-    N_steps=1000,
-    N_steps_print=None,
-    CONV=False,
-    data_init_fraction=0,  # 0.04
-    **EFH_kwargs,
-):
-    
-    if N_steps_print is None:
-        N_steps_print = N_steps//5
-
-    efh_list = []
-
-    for iEFH in range(N_EFH):
-        efh = GEFH(**EFH_kwargs) if CONV else EFH(**EFH_kwargs)
-        efh_list.append(efh)
-        
-        optimizer = torch.optim.Adam(efh.parameters(), lr=0.001)
-
+    @torch.no_grad()
+    def __call__(self):
         start = time.time()
-        for step, (mu_Y, _) in enumerate(training_loader):
-            total_loss = 0
-            N_examples_per_batch = mu_Y.shape[0]
+        for step, (V0, _) in enumerate(self.training_loader):
+            self.optimizer.zero_grad()
 
-            # push data up through stack of EFHs
-            for efh in efh_list:
-                mu_Y, V0 = efh.infer(mu_Y)
+            # collect stats from Gibbs sampling and update params
+            with torch.no_grad():
+                H0, VN, HN, recon_error = self._step(V0)
+            
+            self.efh._gradient_update(V0, H0, VN, HN)
+            self.optimizer.step()
+
+            # validate
+            if (step+1) % self.N_steps_print == 0:
+                start = self._validate(start, step, recon_error)
                 
-            # "positive" phase
-            _, H0 = efh.infer(V0)
-
-            # Abdulsalam 2025
-            if data_init_fraction == 0: 
-                H0_neg = H0
-            else:
-                ### is this the most efficient way?
-                N_data_init_examples = round(N_examples_per_batch*data_init_fraction)
-                inds = np.random.choice(N_examples_per_batch, N_data_init_examples)
-                V_random = torch.randn((N_data_init_examples, *V0.shape[1:]))
-                _, H_random = efh.infer(V_random)
-
-                H0_neg = H0
-                H0_neg[inds] = H_random
-
-            # negative phase
-            # mu_VN, VN, mu_HN, HN = efh(H0_neg, N_CD_steps)
-            mu_VN, VN, mu_HN, HN = efh(H0, N_CD_steps)
-            ##########
-            # standard GEH hack
-            HN = mu_HN
-            ##########
-
-            # CD-N
-            if CONV:
-                grad_W_pos = nn.grad.conv2d_weight(V0, efh.W.shape, H0, stride=efh.stride, padding=1)
-                grad_W_neg = nn.grad.conv2d_weight(VN, efh.W.shape, HN, stride=efh.stride, padding=1)
-                efh.W.grad = (grad_W_neg - grad_W_pos) / N_examples_per_batch
-                efh.b_vis.grad = -(V0 - VN).sum(dim=(0, 2, 3)) / N_examples_per_batch
-                efh.b_hid.grad = -(H0 - HN).sum(dim=(0, 2, 3)) / N_examples_per_batch
-            else:
-                efh.W.grad = - (H0.T @ V0 - HN.T @ VN) / N_examples_per_batch
-                efh.b_vis.grad = -(V0 - VN).sum(dim=0) / N_examples_per_batch
-                efh.b_hid.grad = -(H0 - HN).sum(dim=0) / N_examples_per_batch
-
-            optimizer.step()
-            optimizer.zero_grad()
-
-            loss = torch.mean((V0 - mu_VN)**2)
-            total_loss += loss.item()
-
-            if (step+1) % N_steps_print == 0:
-                torch.cuda.synchronize()
-                
-                print_fixed("step", step, 6, 0, 0, end='')
-                print_fixed("infer time", time.time() - start, 8, 3, 0, end='')
-                # print_fixed("loss", total_loss, 6, 2, 0, end='')
-                print_fixed("loss", total_loss, 6, 2, -2, end='')
-
-                efh.eval()
-                validator(efh, step)
-                efh.train()
-                
-                print()
-                start = time.time()
-
-            if step == N_steps:
+            # break condition
+            if step == self.N_steps:
                 break
 
-        print('------------------')
-        print('trained EFH %i' % iEFH)
-        print('------------------')
+    @torch.no_grad()
+    def _step(self, V0):
 
-    return efh_list
+        # "positive" phase
+        _, H0 = self.efh.infer(V0)
+
+        # Abdulsalam 2025
+        if self.data_init_fraction > 0:
+            H0 = self.noise_init(H0, V0.shape)
+
+        # negative phase
+        mu_VN, VN, mu_HN, HN = self.efh(H0, self.N_CD_steps)
+        recon_error = torch.mean((V0 - mu_VN)**2)
+        
+        # standard GEH hack
+        return H0, VN, mu_HN, recon_error
+        ### return H0, VN, HN, recon_error
+
+    @torch.no_grad()
+    def noise_init(self, H0, V0_shape):
+        # Abdulsalam 2025
+
+        # Ns
+        N_examples_per_batch = V0_shape[0]
+        N_data_init_examples = round(N_examples_per_batch*self.data_init_fraction)
+
+        # pass (a small number of) noise samples up through the network
+        V_random = torch.randn((N_data_init_examples, *V0_shape[1:]))
+        _, H_random = self.efh.infer(V_random)
+
+        # replace random subset of inferences from data with inferences from noise
+        inds = np.random.choice(N_examples_per_batch, N_data_init_examples)
+        H0[inds] = H_random
+
+        return H0
+
+    @torch.no_grad()
+    def _validate(self, start, step, recon_error):
+        torch.cuda.synchronize()
+        
+        print_fixed("step", step, 6, 0, 0, end='')
+        print_fixed("infer time", time.time() - start, 8, 3, 0, end='')
+        print_fixed("loss", recon_error, 6, 2, -2, end='')
+
+        self.efh.eval()
+        self.validator(self.efh, step)
+        self.efh.train()
+        
+        print()
+        return time.time()
+
+
+class DBN(nn.Module):
+    def __init__(
+        self, layer_specs=None, layers=None, **kwargs
+    ):
+        super().__init__()
+      
+        if layers is not None:
+            self.layers = nn.ModuleList(layers) 
+        elif layer_specs is not None:
+            self.layers = nn.ModuleList()
+
+            C_in = layer_specs[0]['channels']
+            emission_family = layer_specs[0]['family']
+
+            for layer_spec in layer_specs[1:]:
+                C_out = layer_spec['channels']
+                posterior_family = layer_spec['family']
+                kernel_width = layer_spec['kernel width']
+                N_trials = layer_spec.get('N_trials', None)
+                # create an EFH and append it to the layer list
+                new_efh = EFH(
+                    C_in=C_in,
+                    C_out=C_out,
+                    kernel_width=kernel_width,
+                    emission_family=emission_family,
+                    posterior_family=posterior_family,
+                    N_trials=N_trials,
+                    **kwargs
+                )
+                self.layers.append(new_efh)
+
+                # for next time around
+                #########
+                # This won't quite work if one EFH is conv and the next is not...
+                C_in = C_out
+                emission_family = posterior_family
+                #########
+
+        else:
+            # self.layers = nn.ModuleList()
+            pdb.set_trace()
+
+    def __iter__(self):
+        return iter(self.layers)
+
+    def __len__(self):
+        return len(self.layers)
+
+    def __getitem__(self, idx):
+        # support for slicing like dbn[:i]
+        if isinstance(idx, slice):
+            # return DBN(nn.ModuleList(self.layers[idx]))
+            return DBN(layers=self.layers[idx])
+        return self.layers[idx]
+
+    @torch.no_grad()
+    def infer(self, vis, USE_MEANS=False):
+        Y = vis
+        for efh in self.layers:
+            mu_H, H = efh.infer(Y)
+            Y = mu_H if USE_MEANS else H
+        return Y
+
+    @torch.no_grad()
+    def emit(self, hid, USE_MEANS=False):
+        X = hid
+        for efh in reversed(self.layers):
+            mu_V, V = efh.emit(X)
+            X = mu_V if USE_MEANS else V
+        return X
+
+    @torch.no_grad()
+    def updown(self, vis, USE_MEANS=True):
+        hid = self.infer(vis, USE_MEANS=USE_MEANS)
+        vis = self.emit(hid, USE_MEANS=USE_MEANS)
+        return vis
+
+    @torch.no_grad()
+    def generate(self, N_CD_steps, num_examples, H=None, W=None, USE_MEANS=True):
+        # compute H and W are for the *visible layer* of the *deepest* EFH from
+        #  H and W for the *first* EFH.
+
+        if len(self.layers) > 0:
+            shapes = self.compute_spatial_path(H, W)
+            H, W = shapes[-2]  # penultimate layer
+
+            X = self.layers[-1].generate(
+                N_CD_steps, num_examples, H=H, W=W, USE_MEANS=USE_MEANS
+            )
+            for efh in reversed(self.layers[:-1]):
+                mu_V, V = efh.emit(X)
+                X = mu_V if USE_MEANS else V
+            return X
+
+    def get_height_width(self, H, W):
+        """
+        Traces H and W through every layer to find the shapes 
+        at each 'junction' in the DBN.
+
+        Courtesy of Gemini
+        """
+
+        for efh in self.layers[:-1]:
+            # kernel_width, stride, padding
+            k = efh.W.shape[2]
+            s = efh.stride
+            p = getattr(efh, 'padding', 0) 
+            
+            # standard Conv2d output shape formula
+            H = ((H + 2*p - k) // s) + 1
+            W = ((W + 2*p - k) // s) + 1
+            
+        return H, W
+
+    def compute_spatial_path(self, H, W):
+        """
+        Traces H and W through every layer to find the shapes 
+        at each 'junction' in the DBN.
+
+        Courtesy of Gemini
+        """
+
+        shapes = [(H, W)]
+        curr_h, curr_w = H, W
+        
+        for efh in self.layers:
+            # kernel_width, stride, padding
+            k = efh.W.shape[2]
+            s = efh.stride
+            p = getattr(efh, 'padding', 0) 
+            
+            # standard Conv2d output shape formula
+            curr_h = ((curr_h + 2*p - k) // s) + 1
+            curr_w = ((curr_w + 2*p - k) // s) + 1
+            shapes.append((curr_h, curr_w))
+            
+        # a list of (H, W) for every junction
+        return shapes  
+
+
+class DBNtrainer():
+    @auto_attribute
+    def __init__(
+        self,
+        dbn,
+        layer0_loader,
+        validator,
+        N_CD_steps=1,
+        N_steps=1000,
+        N_steps_print=None,
+        data_init_fraction=0,  # 0.04
+    ):
+        pass
+
+    def __call__(self):
+        
+        efh_validator = self.validator
+        for iEFH, efh in enumerate(self.dbn):
+
+            # validate the entire DBN up to this point
+            print('%i-EFH reconstruction: ' % iEFH, end='')
+            self.validator(self.dbn[:iEFH], 0)
+            print()
+
+            # train 
+            trainer = EFHtrainer(
+                efh,
+                LayeredDataset(self.layer0_loader, self.dbn[:iEFH]),
+                efh_validator,
+                N_CD_steps=self.N_CD_steps,
+                N_steps=self.N_steps,
+                N_steps_print=self.N_steps_print,
+                data_init_fraction=self.data_init_fraction,
+            )
+            trainer()
+            print('------------------')
+            print('trained EFH %i' % iEFH)
+            print('------------------')
+
+            # but you can't validate deeper EFHs the normal way....
+            efh_validator = lambda efh, step: None
+
+        # validate entire DBN
+        self.validator(self.dbn, 0)
+
+
+class LayeredDataset(IterableDataset):
+    def __init__(self, source_loader, dbn):
+        self.source_loader = source_loader
+        self.dbn = dbn
+
+    def __iter__(self):
+        for batch in self.source_loader:
+            with torch.no_grad():
+                datum, label = batch
+                # Apply the whole stack in one tight loop
+                for efh in self.dbn:
+                    mu_H, H = efh.infer(datum)
+                    # use means
+                    datum = mu_H
+                yield datum, label
+
 
 #-----------------------------------------------------------------------------#
 # Fast multinomial samplers (courtesy of Gemini 3.0)
@@ -549,7 +644,7 @@ def plot_reconstruction_components(efh, vis_image):
         h_single[:, ch, :, :] = mu_h[:, ch, :, :]
         
         # Emit just that one channel (without bias to see pure filter contribution)
-        eta_single = F.conv_transpose2d(h_single, efh.W, stride=efh.stride, padding=1)
+        eta_single = F.conv_transpose2d(h_single, efh.W, stride=efh.stride, padding=0)
         comp = torch.exp(eta_single) # The Poisson rate contribution
         
         axes[i+2].imshow(comp[0, 0].cpu(), cmap='magma')
@@ -560,7 +655,7 @@ def plot_reconstruction_components(efh, vis_image):
         plt.show()
 
 
-def generate_and_plot(efh, CONV, N_CD_steps, C, H, W, N_rows=5, N_cols=5):
+def generate_and_plot(dbn, N_CD_steps, C, H, W, N_rows=5, N_cols=5):
     # This functon makes sense for CIFAR and MNIST, but not multisensory data:
     #  (1) FLAT multisensory data are not equivalent to flattened NCHW data,
     #      because you want to allow for unequally sized populations.  So the
@@ -568,11 +663,23 @@ def generate_and_plot(efh, CONV, N_CD_steps, C, H, W, N_rows=5, N_cols=5):
     #  (2) In any case, imshow doesn't know what to do with 2 channels and
     #      fails (it can only handle 1, 3, or 4 channel data).
 
-    if CONV:
-        VF = efh.generate(N_CD_steps, N_rows*N_cols, H, W)
+    try:
+        # it's a DBN
+        w_shape = dbn[0].W.shape
+    except TypeError:
+        # it's an EFH
+        w_shape = dbn.W.shape
+    except IndexError:
+        return
+
+    if w_shape[2] == 1 and w_shape[3] == 1:
+        # it's a "1x1" convolution and was probably flattened
+        VF = dbn.generate(N_CD_steps, N_rows*N_cols, 1, 1)
+        VF = VF.reshape(N_rows*N_cols, C, H, W)
     else:
-        VF = efh.generate(N_CD_steps, N_rows*N_cols)
-        VF = VF.reshape((N_rows*N_cols, C, H, W))
+        # it's a real convolution
+        VF = dbn.generate(N_CD_steps, N_rows*N_cols, H, W)
+
 
     # imshow wants channels *last*
     VF = VF.permute(0, 2, 3, 1)
@@ -586,3 +693,118 @@ def generate_and_plot(efh, CONV, N_CD_steps, C, H, W, N_rows=5, N_cols=5):
             else:
                 # just plot the first channel
                 ax.imshow(VF[k + i*N_cols].cpu().detach())
+
+
+#####
+# DEPRECATED
+# This is a *non*-convolutional EFH.  You now interpret all EFHs as convs, just
+#  possibly 1x1 convs....  (You do adjust the logic for computing the gradient in
+#  that case, because it's 200x faster.)
+#####
+# class EFH(nn.Module):
+#     def __init__(
+#         self,
+#         C_in=784,
+#         C_out=256,
+#         kernel_width=1,
+#         emission_family='Bernoulli',
+#         posterior_family='Bernoulli',
+#         N_trials=4,  # for multinomial sampler
+#     ):
+
+#         super().__init__()
+#         self.b_vis = nn.Parameter(torch.zeros(C_in))
+#         self.b_hid = nn.Parameter(torch.zeros(C_out))
+#         self.W = nn.Parameter(torch.randn(C_out, C_in) * 0.001)
+        
+#         self.emission_family = emission_family
+#         self.posterior_family = posterior_family
+#         self.N_trials = N_trials
+
+#     @torch.no_grad()
+#     def moments_to_samples(self, moments, distribution, **kwargs):
+#         match distribution:
+#             case 'Bernoulli':
+#                 return torch.distributions.Bernoulli(probs=moments, **kwargs).sample()
+#             case 'Poisson':
+#                 return torch.distributions.Poisson(rate=moments, **kwargs).sample()
+#             case 'multinomial':
+#                 samples = multinomial_gemini(moments/self.N_trials, self.N_trials)
+#                 # mean-field
+#                 # samples = mu
+                
+#                 return samples
+#             case _:
+#                 raise NotImplementedError(
+#                     'Sampling not implemented for %s distribution' % distribution
+#                 )
+
+#     def inverse_link(self, natural_parameters, distribution):
+#         match distribution:
+#             case 'Bernoulli':
+#                 return torch.sigmoid(natural_parameters)
+#             case 'Poisson':
+#                 ######
+#                 # clamped exp or softplus?
+#                 return torch.exp(natural_parameters)
+#                 ######
+#             case 'multinomial':
+#                 # assume probs sum in dimension 1!!!
+#                 # E[X] = N*p
+#                 return self.N_trials*F.softmax(natural_parameters, dim=1)
+#             case _:
+#                 raise NotImplementedError(
+#                     'Inverse link not implemented for %s distribution' % distribution
+#                 )
+
+#     def conditional(self, X, weights, biases, family):
+#         eta = F.linear(X, weights, biases)
+#         mu = self.inverse_link(eta, family)
+#         samples = self.moments_to_samples(mu, family)
+#         return mu, samples
+
+#     def infer(self, vis):
+#         return self.conditional(vis, self.W, self.b_hid, self.posterior_family)
+
+#     def emit(self, hid):
+#         return self.conditional(hid, self.W.T, self.b_vis, self.emission_family)
+
+#     def forward(self, hid, N_CD_steps):
+#         # block Gibbs sample
+#         for _ in range(N_CD_steps):
+#             mu_vis, vis = self.emit(hid)
+#             mu_hid, hid = self.infer(vis)
+
+#         return mu_vis, vis, mu_hid, hid
+
+#     @torch.no_grad()
+#     def updown(self, vis, USE_MEANS=True):
+#         mu_H, H = self.infer(vis)
+#         hid = mu_H if USE_MEANS else H
+#         mu_V, V = self.emit(hid)
+#         vis = mu_V if USE_MEANS else V
+#         return vis
+
+#     @torch.no_grad()
+#     def generate(self, N_CD_steps, num_examples, USE_MEANS=True):
+
+#         # ...
+#         data_shape = (num_examples, self.W.shape[1])
+
+#         # assume that generation starts from standard normal noise
+#         V0 = torch.randn(data_shape)
+        
+#         mu_H0, H0 = self.infer(V0)
+#         hid = mu_H0 if USE_MEANS else H0
+#         mu_VN, _, _, _ = self.forward(hid, N_CD_steps)
+    
+#         return mu_VN
+
+#     @torch.no_grad()
+#     def _gradient_update(self, V0, H0, VN, HN):
+#         N_examples = V0.shape[0]
+#         self.W.grad = - (H0.T @ V0 - HN.T @ VN) / N_examples
+#         self.b_vis.grad = -(V0 - VN).sum(dim=0) / N_examples
+#         self.b_hid.grad = -(H0 - HN).sum(dim=0) / N_examples
+
+

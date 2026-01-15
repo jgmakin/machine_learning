@@ -13,6 +13,9 @@ try:
     from torch.utils.data import Dataset
     from torchvision.transforms import v2
     import torchvision
+
+    torch.backends.cudnn.enabled = True
+    torch.backends.cudnn.benchmark = True
 except ModuleNotFoundError:
     print('WARNING: torch missing; skipping')
 
@@ -131,7 +134,7 @@ class LocalCIFAR10(torchvision.datasets.CIFAR10):
         # 2. (N, H, W, C) -> (N, C, H, W)
         self.data = self.data.permute(0, 3, 1, 2)
         if FLATTEN:
-            self.data = self.data.reshape((self.data.shape[0], -1))
+            self.data = self.data.reshape((self.data.shape[0], -1, 1, 1))
         
         # 3. Move targets to GPU
         # self.targets is a list, so we convert to tensor first
@@ -160,7 +163,7 @@ class LocalMNIST(torchvision.datasets.MNIST):
         self.device = device
         self.data = self.data.to(self.device).float()/255.0
         if FLATTEN:
-            self.data = self.data.reshape((self.data.shape[0], -1))
+            self.data = self.data.reshape((self.data.shape[0], -1, 1, 1))
         else:
             # add channel dimension
             self.data = self.data.unsqueeze(1)  
@@ -537,6 +540,12 @@ class TargetFilter:
         else:
             return dataset
 
+
+# for consistency with generators that *are* infinite
+def infinite_dataloader(loader):
+    while True:
+        for batch in loader:
+            yield batch
 
 #####
 # DEPRECATED: too slow
