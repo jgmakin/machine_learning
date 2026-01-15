@@ -142,8 +142,13 @@ class EFH(nn.Module):
 
         # this is secretly just a 1x1 conv (perhaps a linear layer)
         if w_shape[2] == 1 and w_shape[3] == 1:
-            grad_W_pos = (H0.view(N, -1).T @ V0.view(N, -1)).view(w_shape)
-            grad_W_neg = (HN.view(N, -1).T @ VN.view(N, -1)).view(w_shape)
+            H0_flat = H0.permute(0, 2, 3, 1).reshape(N, -1)
+            V0_flat = V0.permute(0, 2, 3, 1).reshape(N, -1)
+            grad_W_pos = (H0_flat.T @ V0_flat).view(w_shape)
+
+            HN_flat = HN.permute(0, 2, 3, 1).reshape(N, -1)
+            VN_flat = VN.permute(0, 2, 3, 1).reshape(N, -1)
+            grad_W_neg = (HN_flat.T @ VN_flat).view(w_shape)
         else:
             grad_W_pos = nn.grad.conv2d_weight(
                 V0, w_shape, H0, stride=self.stride, padding=0
@@ -339,6 +344,9 @@ class DBN(nn.Module):
     def infer(self, vis, USE_MEANS=False):
         Y = vis
         for efh in self.layers:
+            # w_shape = efh.W.shape
+            # if w_shape[2] == 1 and w_shape[3] == 1:
+            #     Y = Y.flatten(start_dim=1)
             mu_H, H = efh.infer(Y)
             Y = mu_H if USE_MEANS else H
         return Y
@@ -373,26 +381,6 @@ class DBN(nn.Module):
                 mu_V, V = efh.emit(X)
                 X = mu_V if USE_MEANS else V
             return X
-
-    def get_height_width(self, H, W):
-        """
-        Traces H and W through every layer to find the shapes 
-        at each 'junction' in the DBN.
-
-        Courtesy of Gemini
-        """
-
-        for efh in self.layers[:-1]:
-            # kernel_width, stride, padding
-            k = efh.W.shape[2]
-            s = efh.stride
-            p = getattr(efh, 'padding', 0) 
-            
-            # standard Conv2d output shape formula
-            H = ((H + 2*p - k) // s) + 1
-            W = ((W + 2*p - k) // s) + 1
-            
-        return H, W
 
     def compute_spatial_path(self, H, W):
         """
@@ -432,12 +420,25 @@ class DBNtrainer():
         N_steps_print=None,
         data_init_fraction=0,  # 0.04
     ):
-        pass
+        N_EFHs = len(dbn)
+
+        if type(N_CD_steps) is int:
+            self.N_CD_steps = [N_CD_steps]*N_EFHs
+        if type(N_CD_steps) is list:
+            assert len(N_CD_steps) == N_EFHs
+
+        if type(N_steps) is int:
+            self.N_steps = [N_steps]*N_EFHs
+        if type(N_steps) is list:
+            assert len(N_steps) == N_EFHs
 
     def __call__(self):
         
-        efh_validator = self.validator
-        for iEFH, efh in enumerate(self.dbn):
+        ### efh_validator = self.validator
+        efh_validator = lambda efh, step: None
+        for iEFH, (efh, CD_steps, steps) in enumerate(zip(
+            self.dbn, self.N_CD_steps, self.N_steps
+        )):
 
             # validate the entire DBN up to this point
             print('%i-EFH reconstruction: ' % iEFH, end='')
@@ -449,8 +450,8 @@ class DBNtrainer():
                 efh,
                 LayeredDataset(self.layer0_loader, self.dbn[:iEFH]),
                 efh_validator,
-                N_CD_steps=self.N_CD_steps,
-                N_steps=self.N_steps,
+                N_CD_steps=CD_steps,
+                N_steps=steps,
                 N_steps_print=self.N_steps_print,
                 data_init_fraction=self.data_init_fraction,
             )
@@ -690,9 +691,12 @@ def generate_and_plot(dbn, N_CD_steps, C, H, W, N_rows=5, N_cols=5):
             if C in [1, 3, 4]:
                 # imshow can handle 1, 3, or 4 channels
                 ax.imshow(VF[k + i*N_cols].cpu().detach())
+                ax.set_axis_off()
             else:
                 # just plot the first channel
                 ax.imshow(VF[k + i*N_cols].cpu().detach())
+                ax.set_axis_off()
+    plt.show()
 
 
 #####
